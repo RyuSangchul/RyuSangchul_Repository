@@ -15,8 +15,8 @@ st.set_page_config(page_title="논문 분석 Pro", layout="wide")
 # -----------------------------------------------------------
 # [2] 메인 UI
 # -----------------------------------------------------------
-st.title("📑 논문 분석 Pro [ver6.7 - Image Recovery]")
-st.caption("✅ 이미지 추출 기능 복구 | 20px 이하 로고/아이콘 자동 삭제 | 한글 출력 필수")
+st.title("📑 논문 분석 Pro [ver6.8 - Fine Filter]")
+st.caption("✅ 이미지 필터 완화 (30px 이하만 삭제) | 놓치는 그림 없이 최대한 수집 | 한글 출력")
 
 # -----------------------------------------------------------
 # [3] 사이드바
@@ -122,7 +122,7 @@ def merge_nearby_rectangles(rects, distance=20):
 
 
 # -----------------------------------------------------------
-# [5] 핵심 로직 함수 (안정성 강화)
+# [5] 핵심 로직 함수 (필터 완화)
 # -----------------------------------------------------------
 def extract_data_from_pdf(uploaded_file):
     pdf_bytes = uploaded_file.getvalue()
@@ -142,7 +142,7 @@ def extract_data_from_pdf(uploaded_file):
             text = b[4].strip()
             final_text_content += text + "\n"
 
-            # 캡션 인식 (Fig, Table, 그림, 표)
+            # 캡션 인식
             if re.match(r"^(Fig|Figure|Table|그림|표)\s*\.?\s*\d+", text, re.IGNORECASE) and len(text) < 300:
                 bbox = fitz.Rect(b[0], b[1], b[2], b[3])
                 cap_type = "Table" if (text.startswith("Table") or text.startswith("표")) else "Figure"
@@ -154,29 +154,28 @@ def extract_data_from_pdf(uploaded_file):
                     "type": cap_type, "label": label, "matched_img_id": None
                 })
 
-        # 2. 페이지 이미지 저장 (AI 텍스트 분석 보완용)
+        # 2. 페이지 이미지 저장
         pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
         img_data = Image.open(io.BytesIO(pix.tobytes("png")))
         all_page_images.append(img_data)
 
-        # 3. 이미지 추출 (기존 방식 복구 + 필터링 강화)
+        # 3. 이미지 추출 (필터 완화: 30px)
         image_list = page.get_images(full=True)
         raw_rects = []
 
         for img in image_list:
             xref = img[0]
-            # 이미지 위치 정보 가져오기
             try:
                 img_rects = page.get_image_rects(xref)
                 for r in img_rects:
-                    # [핵심 필터] 너무 작은 이미지(로고, 아이콘)는 버림
-                    if r.width < 20 or r.height < 20:
+                    # [사용자 요청 수정] 30px 미만만 버림 (이전 100px은 너무 컸음)
+                    if r.width < 30 or r.height < 30:
                         continue
                     raw_rects.append(r)
             except:
                 continue
 
-        # 겹치는 이미지 영역 병합
+        # 겹치는 이미지 영역 병합 (작은 조각들을 하나로 합침)
         merged_rects = merge_nearby_rectangles(raw_rects, distance=20)
 
         for rect in merged_rects:
@@ -186,38 +185,26 @@ def extract_data_from_pdf(uploaded_file):
             })
             image_counter += 1
 
-    # 4. 캡션과 이미지 매칭 (거리 기반)
+    # 4. 캡션과 이미지 매칭
     for cap in all_captions:
         best_img = None
         min_score = float('inf')
 
-        # 같은 페이지에 있는 이미지들만 후보로 선정
         candidates = [img for img in all_images_info if img["page"] == cap["page"] and img["matched_caption"] is None]
 
         for img in candidates:
-            # Figure는 캡션이 보통 아래, Table은 위
-            # 하지만 너무 엄격하면 놓칠 수 있으니 거리 점수(Score)제로 계산
-
-            # 수직 거리
             if cap["type"] == "Figure":
-                # 그림은 캡션보다 위에 있어야 함 (캡션 y0 - 이미지 y1)
                 v_dist = (cap["bbox"].y0 - img["bbox"].y1)
             else:
-                # 표는 캡션보다 아래에 있어야 함 (이미지 y0 - 캡션 y1)
                 v_dist = (img["bbox"].y0 - cap["bbox"].y1)
 
-            # 방향이 맞지 않으면 페널티 부여, 하지만 아주 가깝다면 허용
-            if v_dist < -50:  # -50px 이상 반대 방향이면 제외
-                continue
+            if v_dist < -50: continue
 
             abs_v_dist = abs(v_dist)
-
-            # 수평 거리 (중앙 정렬 여부)
             cap_center_x = (cap["bbox"].x0 + cap["bbox"].x1) / 2
             img_center_x = (img["bbox"].x0 + img["bbox"].x1) / 2
             h_align_dist = abs(cap_center_x - img_center_x)
 
-            # 점수 계산 (거리가 가까울수록 좋음)
             total_score = abs_v_dist + (h_align_dist * 0.5)
 
             if total_score < min_score:
@@ -234,7 +221,6 @@ def extract_data_from_pdf(uploaded_file):
         page = doc[img_info["page"]]
         rect = img_info["bbox"]
 
-        # 이미지 영역 캡처
         padding = 10
         clip_rect = fitz.Rect(rect.x0 - padding, rect.y0 - padding, rect.x1 + padding, rect.y1 + padding) & page.rect
 
@@ -260,7 +246,6 @@ def extract_data_from_pdf(uploaded_file):
 def get_gemini_analysis(text, total_images, all_page_images):
     inputs = []
 
-    # [프롬프트] 한국어 필수, 이미지 매칭 강조
     prompt = f"""
     너는 한국어 논문 분석 전문가야. 제공된 자료를 보고 JSON을 추출해.
 
@@ -300,7 +285,6 @@ def get_gemini_analysis(text, total_images, all_page_images):
     else:
         inputs.append("[시스템 알림: 텍스트 추출 실패. 아래의 '전체 페이지 이미지'를 읽고 분석하세요.]")
 
-    # 텍스트 부족 시 이미지 전송
     if not is_text_valid:
         max_pages = 30
         for i, img in enumerate(all_page_images[:max_pages]):
@@ -357,7 +341,6 @@ def create_excel(paper_number, analysis_json, images, final_figures, final_table
         ws1.write(current_row, 1, str(content), content_style)
         current_row += 1
 
-    # Figure 섹션
     if final_figures:
         current_row += 1
         ws1.write(current_row, 0, "그림 (Figures)", header_style)
@@ -368,7 +351,6 @@ def create_excel(paper_number, analysis_json, images, final_figures, final_table
             _write_row_dynamic(ws1, item, images, current_row, fig_style, content_style)
             current_row += 2
 
-    # Table 섹션
     if final_tables:
         current_row += 1
         ws1.write(current_row, 0, "표 (Tables)", header_style)
@@ -443,14 +425,14 @@ if uploaded_file and paper_num:
         if st.session_state.analyzed_data and st.session_state.analyzed_data['file_name'] == uploaded_file.name:
             st.success("⚡ 저장된 분석 결과를 불러옵니다.")
         else:
-            with st.spinner(f"[{SELECTED_MODEL_NAME}] 분석 중... (이미지 복구 모드)"):
+            with st.spinner(f"[{SELECTED_MODEL_NAME}] 분석 중... (30px 이하만 삭제)"):
                 try:
                     text, images, all_page_imgs = extract_data_from_pdf(uploaded_file)
 
                     if len(text.strip()) < 500:
                         st.warning("⚠️ 텍스트 추출이 불안정하여 전체 페이지 분석을 병행합니다.")
                     else:
-                        st.info(f"✅ 텍스트 및 {len(images)}개의 유효 이미지(로고 제외) 추출 완료!")
+                        st.info(f"✅ 텍스트 및 {len(images)}개의 이미지 추출 완료!")
 
                     result = get_gemini_analysis(text, len(images), all_page_imgs)
 
@@ -494,6 +476,6 @@ if uploaded_file and paper_num:
         st.download_button(
             label="📥 엑셀 파일 다운로드",
             data=excel_data,
-            file_name=f"Analysis_v6.7_{paper_num}.xlsx",
+            file_name=f"Analysis_v6.8_{paper_num}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
