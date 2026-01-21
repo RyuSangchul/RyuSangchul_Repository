@@ -17,7 +17,7 @@ st.set_page_config(page_title="논문 분석 Pro", layout="wide")
 # -----------------------------------------------------------
 # [2] 메인 UI
 # -----------------------------------------------------------
-st.title("📑 논문 분석 Pro [ver5.91]")
+st.title("📑 논문 분석 Pro [ver6.0]")
 st.caption("✅ 이미지 내 텍스트(Fig/Table) 분석 | 개조식 요약 적용")
 
 # -----------------------------------------------------------
@@ -441,3 +441,4 @@ if uploaded_file and paper_num:
             file_name=f"Analysis_v6.0_{paper_num}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
+
