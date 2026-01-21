@@ -15,8 +15,8 @@ st.set_page_config(page_title="논문 분석 Pro", layout="wide")
 # -----------------------------------------------------------
 # [2] 메인 UI
 # -----------------------------------------------------------
-st.title("📑 논문 분석 Pro [ver6.4 - Classification Fix]")
-st.caption("✅ Figure/Table 구분 강화 | 번호(1, 2, 3) 자동 정렬 기능 추가")
+st.title("📑 논문 분석 Pro [ver6.5]")
+st.caption("✅ 결과 무조건 한글 출력 | Figure -> '그림', Table -> '표' 자동 변환")
 
 # -----------------------------------------------------------
 # [3] 사이드바
@@ -59,41 +59,43 @@ model = genai.GenerativeModel(SELECTED_MODEL_NAME)
 
 
 # -----------------------------------------------------------
-# [4] 유틸리티 함수 (강화됨)
+# [4] 유틸리티 함수
 # -----------------------------------------------------------
 def normalize_id(ref_text):
-    """Image_1 -> Image_1 변환"""
     nums = re.findall(r'\d+', str(ref_text))
     return f"Image_{nums[0]}" if nums else None
 
 
-def standardize_label(label_text):
+def standardize_label_to_korean(label_text):
     """
-    [핵심 기능] 라벨 텍스트를 분석해서 (타입, 번호) 튜플을 반환합니다.
-    예: "Fig. 3 결과 그래프" -> ("Figure", 3, "Fig. 3 결과 그래프")
-    예: "Table 2. 실험 조건" -> ("Table", 2, "Table 2. 실험 조건")
+    라벨을 분석해서 한글로 변환 (Figure 1 -> 그림 1)
     """
     if not label_text:
-        return ("Unknown", 999, "Unknown")
+        return ("Unknown", 999, "미분류")
 
     label_upper = str(label_text).upper()
 
-    # 1. 타입 결정
-    detected_type = "Figure"  # 기본값
+    # 1. 타입 결정 및 한글 변환
+    detected_type = "Figure"
+    korean_prefix = "그림"
+
     if "TAB" in label_upper or "표" in label_upper:
         detected_type = "Table"
+        korean_prefix = "표"
     elif "FIG" in label_upper or "그림" in label_upper:
         detected_type = "Figure"
+        korean_prefix = "그림"
 
-    # 2. 번호 추출 (숫자 찾기)
-    # "Figure 1", "Fig.1", "Table-3" 등에서 숫자만 뽑음
+    # 2. 번호 추출
     nums = re.findall(r'\d+', label_text)
     if nums:
         detected_num = int(nums[0])
+        final_label = f"{korean_prefix} {detected_num}"
     else:
-        detected_num = 999  # 숫자가 없으면 맨 뒤로 보냄
+        detected_num = 999
+        final_label = f"{korean_prefix} (번호 없음)"
 
-    return (detected_type, detected_num, label_text)
+    return (detected_type, detected_num, final_label)
 
 
 def merge_nearby_rectangles(rects, distance=20):
@@ -139,14 +141,10 @@ def extract_data_from_pdf(uploaded_file):
             text = b[4].strip()
             final_text_content += text + "\n"
 
-            # 캡션 후보 식별 (Fig 또는 Table로 시작하는 짧은 문장)
             if (text.startswith("Fig") or text.startswith("Table") or text.startswith("그림") or text.startswith(
                     "표")) and len(text) < 500:
                 bbox = fitz.Rect(b[0], b[1], b[2], b[3])
-
                 cap_type = "Table" if (text.startswith("Table") or text.startswith("표")) else "Figure"
-
-                # 라벨 추출 (예: Fig. 1)
                 label_match = re.match(r"(Fig\.?|Figure|Table|그림|표)\s*\d+", text, re.IGNORECASE)
                 label = label_match.group(0) if label_match else cap_type
 
@@ -155,12 +153,10 @@ def extract_data_from_pdf(uploaded_file):
                     "type": cap_type, "label": label, "matched_img_id": None
                 })
 
-        # 페이지 이미지 저장 (AI 전송용)
         pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
         img_data = Image.open(io.BytesIO(pix.tobytes("png")))
         all_page_images.append(img_data)
 
-        # 논문 내부 이미지 좌표 추출
         image_list = page.get_images(full=True)
         raw_rects = []
         for img in image_list:
@@ -178,15 +174,12 @@ def extract_data_from_pdf(uploaded_file):
             })
             image_counter += 1
 
-    # 캡션 매칭 (위치 기반)
     for cap in all_captions:
         best_img = None
         min_score = float('inf')
         candidates = [img for img in all_images_info if img["page"] == cap["page"] and img["matched_caption"] is None]
 
         for img in candidates:
-            # Figure는 보통 캡션이 아래, Table은 보통 캡션이 위에 있음 (일반적 규칙)
-            # 하지만 엄격하게 제한하지 않고 거리 점수로 판단
             v_dist = max(0, cap["bbox"].y0 - img["bbox"].y1) if cap["type"] == "Figure" else max(0,
                                                                                                  img["bbox"].y0 - cap[
                                                                                                      "bbox"].y1)
@@ -205,7 +198,6 @@ def extract_data_from_pdf(uploaded_file):
             cap["matched_img_id"] = best_img["id"]
             best_img["matched_caption"] = cap["label"]
 
-    # 최종 이미지 맵 생성
     extracted_images_map = {}
     for img_info in all_images_info:
         page = doc[img_info["page"]]
@@ -217,7 +209,6 @@ def extract_data_from_pdf(uploaded_file):
         img_bytes = pix.tobytes("png")
 
         img_id = img_info["id"]
-        # 캡션 매칭된 것이 있으면 그것을 우선 사용
         initial_label = img_info["matched_caption"] if img_info["matched_caption"] else "Unknown"
 
         extracted_images_map[img_id] = {
@@ -232,35 +223,34 @@ def extract_data_from_pdf(uploaded_file):
 def get_gemini_analysis(text, total_images, all_page_images):
     inputs = []
 
-    # [프롬프트 강화] 분류 및 번호 인식을 강력하게 지시
+    # [프롬프트 수정] 한국어 강제 출력 지시
     prompt = f"""
-    너는 논문 분석 전문가야. 제공된 자료를 보고 JSON을 추출해.
+    너는 한국어 논문 분석 전문가야. 제공된 자료를 보고 JSON을 추출해.
 
-    [핵심 지시사항]
-    1. **요약(summary)은 반드시 '개조식(Bullet Points)'으로 작성.**
-    2. **이미지 분류(Classification)를 정확히 수행해.**
-       - 이미지 내용을 보고 **'Figure(그림/그래프)'**인지 **'Table(표)'**인지 판단해.
-       - 텍스트에 "Table 1", "Figure 3" 같은 번호가 있다면 그 번호를 반드시 `real_label`에 적어.
-       - 예시: `real_label`: "Figure 1", `real_label`: "Table 2"
-    3. 텍스트가 깨져 보이면 제공된 '페이지 이미지'를 읽어서 내용을 파악해.
+    [절대 규칙]
+    1. **모든 출력 내용은 반드시 '한국어(Korean)'로 작성할 것.** (영어 사용 금지)
+    2. **요약(summary)은 반드시 '개조식(Bullet Points)'으로 작성.**
+    3. **이미지 분류:**
+       - 이미지를 보고 '그림(Figure)'인지 '표(Table)'인지 판단해.
+       - 번호가 있다면 `real_label`에 "Figure 1", "Table 2" 처럼 적어. (나중에 한글로 변환할 거임)
+    4. 텍스트가 깨져 보이면 '페이지 이미지'를 보고 내용을 파악해.
 
     [요청 항목]
     0. title, author, affiliation, year, purpose
-    1. 요약 (intro_summary, body_summary, conclusion_summary)
-    2. key_images_desc
-    3. referenced_images (여기에 각 이미지의 ID와 정확한 라벨을 적어줘)
+    1. 요약 (intro_summary, body_summary, conclusion_summary) - **한국어 작성**
+    2. key_images_desc - **한국어 작성**
+    3. referenced_images 
 
     [출력 포맷 JSON]
     {{
         "title": "...",
         "author": "...", "affiliation": "...", "year": "...", "purpose": "...",
-        "intro_summary": "- ...", 
-        "body_summary": "- ...", 
-        "conclusion_summary": "- ...",
+        "intro_summary": "- 핵심 내용 1...", 
+        "body_summary": "- 핵심 내용 2...", 
+        "conclusion_summary": "- 결론...",
         "key_images_desc": "...",
         "referenced_images": [ 
-            {{ "img_id": "Image_1", "real_label": "Figure 1", "caption": "설명" }},
-            {{ "img_id": "Image_2", "real_label": "Table 1", "caption": "설명" }}
+            {{ "img_id": "Image_1", "real_label": "Figure 1", "caption": "설명(한국어)" }}
         ]
     }}
     """
@@ -324,7 +314,6 @@ def create_excel(paper_number, analysis_json, images, final_figures, final_table
 
     current_row = 1
     for label, content in data_map:
-        # 리스트 에러 방지
         if isinstance(content, list):
             content = "\n".join(map(str, content))
         elif content is None:
@@ -334,10 +323,10 @@ def create_excel(paper_number, analysis_json, images, final_figures, final_table
         ws1.write(current_row, 1, str(content), content_style)
         current_row += 1
 
-    # Figure 섹션 쓰기
+    # Figure 섹션 (한글 라벨 적용)
     if final_figures:
         current_row += 1
-        ws1.write(current_row, 0, "Figures (그림)", header_style)
+        ws1.write(current_row, 0, "그림 (Figures)", header_style)
         ws1.write(current_row, 1, "▼ 주요 그림 목록", header_style)
         current_row += 1
         if current_row % 2 != 0: current_row += 1
@@ -345,10 +334,10 @@ def create_excel(paper_number, analysis_json, images, final_figures, final_table
             _write_row_dynamic(ws1, item, images, current_row, fig_style, content_style)
             current_row += 2
 
-    # Table 섹션 쓰기
+    # Table 섹션 (한글 라벨 적용)
     if final_tables:
         current_row += 1
-        ws1.write(current_row, 0, "Tables (표)", header_style)
+        ws1.write(current_row, 0, "표 (Tables)", header_style)
         ws1.write(current_row, 1, "▼ 주요 표 목록", header_style)
         current_row += 1
         if current_row % 2 != 0: current_row += 1
@@ -365,10 +354,12 @@ def _write_row_dynamic(ws, item, images, row, label_fmt, content_fmt):
     clean_id = normalize_id(item.get('img_id'))
     target = next((img for img in images if img['id'] == clean_id), None)
 
-    label_text = item.get('real_label', 'Figure')
+    # 여기서 한글로 최종 변환하여 엑셀에 기록
+    # item['korean_label']은 위에서 계산된 값
+    final_label = item.get('korean_label', item.get('real_label', '그림'))
     caption_text = item.get('caption', '설명 없음')
 
-    ws.write(row, 0, label_text, label_fmt)
+    ws.write(row, 0, final_label, label_fmt)
     ws.write(row, 1, f"📄 {caption_text}", content_fmt)
 
     img_row = row + 1
@@ -420,7 +411,7 @@ if uploaded_file and paper_num:
         if st.session_state.analyzed_data and st.session_state.analyzed_data['file_name'] == uploaded_file.name:
             st.success("⚡ 저장된 분석 결과를 불러옵니다.")
         else:
-            with st.spinner(f"[{SELECTED_MODEL_NAME}] 분석 중... (정밀 분류 모드)"):
+            with st.spinner(f"[{SELECTED_MODEL_NAME}] 분석 중... (한글 출력 모드)"):
                 try:
                     text, images, all_page_imgs = extract_data_from_pdf(uploaded_file)
 
@@ -437,22 +428,20 @@ if uploaded_file and paper_num:
                         ref_imgs = result.get('referenced_images', [])
                         final_figs, final_tbls = [], []
 
-                        # [분류 로직 강화]
                         for item in ref_imgs:
                             raw_label = item.get('real_label', 'Unknown')
 
-                            # standardize_label 함수를 통해 (타입, 번호, 원본라벨) 분리
-                            detected_type, detected_num, _ = standardize_label(raw_label)
+                            # [핵심] "Figure 1" -> "그림 1" 변환 로직
+                            detected_type, detected_num, korean_label = standardize_label_to_korean(raw_label)
 
-                            # 정렬을 위해 번호 정보를 item에 추가
                             item['sort_num'] = detected_num
+                            item['korean_label'] = korean_label  # 엑셀 출력용 한글 라벨 저장
 
                             if detected_type == "Table":
                                 final_tbls.append(item)
                             else:
                                 final_figs.append(item)
 
-                        # 정렬: 번호 순서대로 (1, 2, 3...)
                         final_figs.sort(key=lambda x: x['sort_num'])
                         final_tbls.sort(key=lambda x: x['sort_num'])
 
@@ -463,7 +452,7 @@ if uploaded_file and paper_num:
                             'figs': final_figs,
                             'tbls': final_tbls
                         }
-                        st.success("완료! 분석이 끝났습니다.")
+                        st.success("완료! 모든 내용은 한글로 변환되었습니다.")
 
                 except Exception as e:
                     st.error(f"시스템 오류: {e}")
@@ -475,6 +464,6 @@ if uploaded_file and paper_num:
         st.download_button(
             label="📥 엑셀 파일 다운로드",
             data=excel_data,
-            file_name=f"Analysis_v6.4_{paper_num}.xlsx",
+            file_name=f"Analysis_v6.5_{paper_num}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
