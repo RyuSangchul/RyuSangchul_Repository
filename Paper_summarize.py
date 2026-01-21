@@ -17,8 +17,8 @@ st.set_page_config(page_title="논문 분석 Pro", layout="wide")
 # -----------------------------------------------------------
 # [2] 메인 UI
 # -----------------------------------------------------------
-st.title("📑 논문 분석 Pro [ver6.0]")
-st.caption("✅ 이미지 내 텍스트(Fig/Table) 분석 | 개조식 요약 적용")
+st.title("📑 논문 분석 Pro [ver6.0 - Debug Mode]")
+st.caption("✅ 개조식 요약 | 🔍 디버깅 모드 추가 (오류 원인 확인용)")
 
 # -----------------------------------------------------------
 # [3] 사이드바
@@ -42,6 +42,7 @@ with st.sidebar:
                 name = m.name.replace('models/', '')
                 available_models.append(name)
 
+        # 1.5-flash를 2.5보다 우선 추천 (안정성 위함)
         preferred = ['gemini-1.5-flash', 'gemini-2.5-flash']
         available_models.sort(key=lambda x: (x not in preferred, x))
 
@@ -235,10 +236,7 @@ def get_gemini_analysis(text, total_images):
     2. **요약(summary)은 반드시 '개조식(Bullet Points)'으로 작성할 것.**
        - 서술형 줄글(Paragraph)을 쓰지 말고, 핵심 내용을 글머리 기호로 나열하세요.
        - 각 요약 항목(intro, body, conclusion) 마다 3개~5개의 핵심 포인트를 작성하세요.
-       - 예시:
-         - 기존 방법의 문제점은 ~임.
-         - 이를 해결하기 위해 ~를 제안함.
-    3. **이미지 매칭 시, 텍스트에 있는 `(Matched with ...)` 정보를 최우선으로 따를 것.**
+    3. **만약 텍스트 내용이 부족하거나 없으면 "내용 없음"이라고 적으세요.**
 
     [요청 항목]
     0. title, author, affiliation, year, purpose
@@ -283,6 +281,7 @@ def create_excel(paper_number, analysis_json, images, final_figures, final_table
     ws1.set_column('A:A', 25)
     ws1.set_column('B:B', 90)
 
+    # JSON 키값이 없을 경우를 대비해 get의 기본값을 명시
     data_map = [
         ("No.", paper_number),
         ("논문 제목", analysis_json.get('title', '제목 없음')),
@@ -390,13 +389,26 @@ if uploaded_file and paper_num:
         else:
             with st.spinner(f"[{SELECTED_MODEL_NAME}] 분석 중..."):
                 try:
+                    # 1. 텍스트 추출
                     text, images = extract_data_from_pdf(uploaded_file)
 
-                    # Gemini 분석 요청 (개조식 요약 포함)
+                    # [디버깅] 추출된 텍스트가 비어있는지 확인
+                    if not text.strip():
+                        st.error("⚠️ PDF에서 텍스트를 추출하지 못했습니다. (스캔된 이미지 PDF이거나 암호화된 파일일 수 있습니다.)")
+                        st.stop()
+                    else:
+                        with st.expander("🔍 디버깅: PDF에서 추출된 텍스트 확인 (앞부분 1000자)"):
+                            st.text(text[:1000])
+
+                    # 2. Gemini 분석 요청
                     result = get_gemini_analysis(text, len(images))
 
+                    # [디버깅] AI 결과값 확인
+                    with st.expander("🔍 디버깅: AI가 반환한 원본 데이터 확인"):
+                        st.json(result)
+
                     if "error" in result:
-                        st.error(f"오류: {result['error']}")
+                        st.error(f"AI 분석 오류: {result['error']}")
                     else:
                         ref_imgs = result.get('referenced_images', [])
                         final_figs, final_tbls = [], []
@@ -429,7 +441,7 @@ if uploaded_file and paper_num:
                         st.success("완료! 개조식 요약이 적용되었습니다.")
 
                 except Exception as e:
-                    st.error(f"오류: {e}")
+                    st.error(f"시스템 오류: {e}")
 
     if st.session_state.analyzed_data:
         data = st.session_state.analyzed_data
@@ -441,4 +453,3 @@ if uploaded_file and paper_num:
             file_name=f"Analysis_v6.0_{paper_num}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
-
