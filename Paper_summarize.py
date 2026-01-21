@@ -16,7 +16,7 @@ st.set_page_config(page_title="논문 분석 Pro", layout="wide")
 # [2] 메인 UI
 # -----------------------------------------------------------
 st.title("📑 논문 분석 Pro [ver6.7 - Image Recovery]")
-st.caption("✅ 이미지 추출 기능 복구 | 100px 이하 로고/아이콘 자동 삭제 | 한글 출력 필수")
+st.caption("✅ 이미지 추출 기능 복구 | 20px 이하 로고/아이콘 자동 삭제 | 한글 출력 필수")
 
 # -----------------------------------------------------------
 # [3] 사이드바
@@ -170,7 +170,7 @@ def extract_data_from_pdf(uploaded_file):
                 img_rects = page.get_image_rects(xref)
                 for r in img_rects:
                     # [핵심 필터] 너무 작은 이미지(로고, 아이콘)는 버림
-                    if r.width < 100 or r.height < 100:
+                    if r.width < 20 or r.height < 20:
                         continue
                     raw_rects.append(r)
             except:
