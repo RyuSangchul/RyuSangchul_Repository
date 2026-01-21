@@ -5,8 +5,6 @@ import xlsxwriter
 import io
 import json
 import re
-import os
-import time
 from PIL import Image
 
 # -----------------------------------------------------------
@@ -17,8 +15,8 @@ st.set_page_config(page_title="논문 분석 Pro", layout="wide")
 # -----------------------------------------------------------
 # [2] 메인 UI
 # -----------------------------------------------------------
-st.title("📑 논문 분석 Pro [ver6.0 - Debug Mode]")
-st.caption("✅ 개조식 요약 | 🔍 디버깅 모드 추가 (오류 원인 확인용)")
+st.title("📑 논문 분석 Pro [ver6.2 - Full Scan]")
+st.caption("✅ 글자가 깨지면 '논문 전체'를 이미지로 읽습니다. | 2.5 Flash 기본")
 
 # -----------------------------------------------------------
 # [3] 사이드바
@@ -42,16 +40,12 @@ with st.sidebar:
                 name = m.name.replace('models/', '')
                 available_models.append(name)
 
-        # 1.5-flash를 2.5보다 우선 추천 (안정성 위함)
-        preferred = ['gemini-1.5-flash', 'gemini-2.5-flash']
+        # [수정됨] 사용자 요청대로 2.5-flash를 최우선으로 배치
+        preferred = ['gemini-2.5-flash', 'gemini-1.5-flash']
         available_models.sort(key=lambda x: (x not in preferred, x))
 
-        if not available_models:
-            st.error("사용 가능한 모델이 없습니다.")
-            st.stop()
-
         selected_model_name = st.selectbox(
-            "✅ 사용 가능한 모델 목록",
+            "✅ 모델 선택 (2.5-flash 기본)",
             available_models,
             index=0
         )
@@ -68,15 +62,12 @@ model = genai.GenerativeModel(SELECTED_MODEL_NAME)
 # -----------------------------------------------------------
 # [4] 유틸리티 함수
 # -----------------------------------------------------------
-
 def normalize_id(ref_text):
-    """이미지 ID 정규화"""
     nums = re.findall(r'\d+', str(ref_text))
     return f"Image_{nums[0]}" if nums else None
 
 
 def merge_nearby_rectangles(rects, distance=20):
-    """사각형 병합 (스마트 머지)"""
     if not rects: return []
     rects.sort(key=lambda r: (r.y0, r.x0))
     merged = []
@@ -102,7 +93,6 @@ def merge_nearby_rectangles(rects, distance=20):
 # -----------------------------------------------------------
 # [5] 핵심 로직 함수
 # -----------------------------------------------------------
-
 def extract_data_from_pdf(uploaded_file):
     pdf_bytes = uploaded_file.getvalue()
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -110,14 +100,20 @@ def extract_data_from_pdf(uploaded_file):
     final_text_content = ""
     image_counter = 1
 
+    # [v6.2 수정] 텍스트 실패 시 전체 페이지를 이미지로 읽기 위해 리스트 준비
+    all_page_images = []
+
     all_captions = []
     all_images_info = []
 
-    # 1. 정보 수집
+    # 1. 정보 수집 및 페이지 이미지 변환
     for page_num, page in enumerate(doc):
+        # 텍스트 추출
         text_blocks = page.get_text("blocks")
         for b in text_blocks:
             text = b[4].strip()
+            final_text_content += text + "\n"
+
             # 캡션 후보 식별
             if (text.startswith("Fig") or text.startswith("Table")) and len(text) < 500:
                 bbox = fitz.Rect(b[0], b[1], b[2], b[3])
@@ -130,6 +126,13 @@ def extract_data_from_pdf(uploaded_file):
                     "type": cap_type, "label": label, "matched_img_id": None
                 })
 
+        # [v6.2 핵심] 모든 페이지를 이미지로 변환하여 저장 (해상도 적절히 조절)
+        # 메모리 절약을 위해 matrix는 1.0~1.5 정도로 설정
+        pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
+        img_data = Image.open(io.BytesIO(pix.tobytes("png")))
+        all_page_images.append(img_data)
+
+        # 논문 내부 그림 추출 (기존 로직)
         image_list = page.get_images(full=True)
         raw_rects = []
         for img in image_list:
@@ -140,7 +143,6 @@ def extract_data_from_pdf(uploaded_file):
                 raw_rects.append(r)
 
         merged_rects = merge_nearby_rectangles(raw_rects, distance=20)
-
         for rect in merged_rects:
             img_id = f"Image_{image_counter}"
             all_images_info.append({
@@ -155,7 +157,6 @@ def extract_data_from_pdf(uploaded_file):
         candidates = [img for img in all_images_info if img["page"] == cap["page"] and img["matched_caption"] is None]
 
         for img in candidates:
-            # 방향 규칙
             if cap["type"] == "Figure" and cap["bbox"].y0 < img["bbox"].y1: continue
             if cap["type"] == "Table" and cap["bbox"].y1 > img["bbox"].y0: continue
 
@@ -177,88 +178,80 @@ def extract_data_from_pdf(uploaded_file):
             cap["matched_img_id"] = best_img["id"]
             best_img["matched_caption"] = cap["label"]
 
-    # 3. 텍스트/이미지 추출
+    # 3. 최종 이미지 추출
     extracted_images_map = {}
-    for page_num, page in enumerate(doc):
-        page_items = []
-        text_blocks = page.get_text("blocks")
-        for b in text_blocks:
-            bbox = fitz.Rect(b[0], b[1], b[2], b[3])
-            matched_cap = next((c for c in all_captions if c["page"] == page_num and c["bbox"] == bbox), None)
-            text = b[4]
-            if matched_cap and matched_cap["matched_img_id"]:
-                text = text.strip() + f"\n[SYSTEM: Matches <<<<{matched_cap['matched_img_id']}>>>>]\n"
-            page_items.append({"type": "text", "y0": b[1], "x0": b[0], "text": text})
+    for img_info in all_images_info:
+        page = doc[img_info["page"]]
+        rect = img_info["bbox"]
+        padding = 35
+        clip_rect = fitz.Rect(rect.x0 - padding, rect.y0 - padding, rect.x1 + padding, rect.y1 + padding) & page.rect
+        mat = fitz.Matrix(2, 2)
+        pix = page.get_pixmap(matrix=mat, clip=clip_rect)
+        img_bytes = pix.tobytes("png")
 
-        page_imgs = [img for img in all_images_info if img["page"] == page_num]
-        for img_info in page_imgs:
-            rect = img_info["bbox"]
-            padding = 35
-            clip_rect = fitz.Rect(rect.x0 - padding, rect.y0 - padding, rect.x1 + padding,
-                                  rect.y1 + padding) & page.rect
-            mat = fitz.Matrix(2, 2)
-            pix = page.get_pixmap(matrix=mat, clip=clip_rect)
-            img_bytes = pix.tobytes("png")
+        img_id = img_info["id"]
+        initial_label = img_info["matched_caption"] if img_info["matched_caption"] else "Figure"
 
-            img_id = img_info["id"]
-            initial_label = img_info["matched_caption"] if img_info["matched_caption"] else "Unknown"
-
-            marker_text = f"\n<<<<{img_id}>>>>\n"
-            if img_info["matched_caption"]:
-                marker_text = f"\n<<<<{img_id} (Matched with {initial_label})>>>>\n"
-
-            page_items.append({
-                "type": "image", "y0": rect.y0, "x0": rect.x0,
-                "text": marker_text,
-                "id": img_id, "bytes": img_bytes, "page": page_num + 1
-            })
-
-            if img_id not in extracted_images_map:
-                extracted_images_map[img_id] = {
-                    "id": img_id, "page": page_num + 1, "bytes": img_bytes,
-                    "initial_label": initial_label
-                }
-
-        page_items.sort(key=lambda item: (item["y0"], item["x0"]))
-        for item in page_items: final_text_content += item["text"]
+        extracted_images_map[img_id] = {
+            "id": img_id, "page": img_info["page"] + 1, "bytes": img_bytes,
+            "initial_label": initial_label, "real_label": initial_label
+        }
 
     extracted_images = list(extracted_images_map.values())
-    return final_text_content, extracted_images
+    return final_text_content, extracted_images, all_page_images
 
 
-def get_gemini_analysis(text, total_images):
-    # [수정됨] 프롬프트: 요약을 개조식으로 강제
+def get_gemini_analysis(text, total_images, all_page_images):
+    inputs = []
+
     prompt = f"""
-    너는 논문 분석 전문가야. 아래 텍스트를 읽고 JSON으로 추출해.
+    너는 논문 분석 전문가야. 제공된 자료(텍스트 또는 이미지)를 보고 JSON으로 추출해.
 
     [지시사항]
     1. **모든 내용은 한국어로 번역.**
-    2. **요약(summary)은 반드시 '개조식(Bullet Points)'으로 작성할 것.**
-       - 서술형 줄글(Paragraph)을 쓰지 말고, 핵심 내용을 글머리 기호로 나열하세요.
-       - 각 요약 항목(intro, body, conclusion) 마다 3개~5개의 핵심 포인트를 작성하세요.
-    3. **만약 텍스트 내용이 부족하거나 없으면 "내용 없음"이라고 적으세요.**
+    2. **요약(summary)은 반드시 '개조식(Bullet Points)'으로 작성.** (서술형 금지)
+    3. 텍스트가 깨져 보인다면 함께 제공된 '페이지 이미지'들을 순서대로 읽어서 내용을 파악해.
+    4. **모든 페이지의 이미지를 참고하여 서론부터 결론까지 빠짐없이 요약해.**
 
     [요청 항목]
     0. title, author, affiliation, year, purpose
-    1. 요약 (intro, body, conclusion) - **반드시 개조식**
+    1. 요약 (intro_summary, body_summary, conclusion_summary)
     2. key_images_desc, referenced_images
 
     [출력 포맷 JSON]
     {{
         "title": "...",
         "author": "...", "affiliation": "...", "year": "...", "purpose": "...",
-        "intro_summary": "- 핵심 내용 1\\n- 핵심 내용 2\\n- 핵심 내용 3", 
-        "body_summary": "- 연구 방법 1\\n- 실험 결과 2\\n- 분석 내용 3", 
-        "conclusion_summary": "- 결론 1\\n- 향후 과제 2",
+        "intro_summary": "- ...", 
+        "body_summary": "- ...", 
+        "conclusion_summary": "- ...",
         "key_images_desc": "...",
         "referenced_images": [ {{ "img_id": "Image_5", "real_label": "Figure 1", "caption": "설명" }} ]
     }}
+    """
 
-    [텍스트]:
-    """ + text[:50000]
+    inputs.append(prompt)
+
+    # [v6.2 개선] 텍스트가 유효한지 체크 후, 부족하면 전체 이미지를 전송
+    is_text_valid = len(text.strip()) > 500
+
+    if is_text_valid:
+        inputs.append(f"[추출된 텍스트 데이터]:\n{text[:50000]}")
+    else:
+        inputs.append("[시스템 알림: 텍스트 추출 실패. 아래의 '전체 페이지 이미지'를 읽고 분석하세요.]")
+
+    # 텍스트가 부족하면 모든 페이지 이미지를 AI에게 제공
+    if not is_text_valid:
+        # 너무 많을 경우를 대비해 최대 30페이지까지만 (용량/속도 고려)
+        max_pages = 30
+        for i, img in enumerate(all_page_images[:max_pages]):
+            inputs.append(f"Page {i + 1} Image:")
+            inputs.append(img)
+        if len(all_page_images) > max_pages:
+            inputs.append("[System: 뒷부분 페이지 일부 생략됨 (용량 제한)]")
 
     try:
-        response = model.generate_content(prompt, generation_config={"response_mime_type": "application/json"})
+        response = model.generate_content(inputs, generation_config={"response_mime_type": "application/json"})
         return json.loads(response.text)
     except Exception as e:
         return {"error": str(e)}
@@ -281,10 +274,9 @@ def create_excel(paper_number, analysis_json, images, final_figures, final_table
     ws1.set_column('A:A', 25)
     ws1.set_column('B:B', 90)
 
-    # JSON 키값이 없을 경우를 대비해 get의 기본값을 명시
     data_map = [
         ("No.", paper_number),
-        ("논문 제목", analysis_json.get('title', '제목 없음')),
+        ("논문 제목", analysis_json.get('title', '-')),
         ("저자", analysis_json.get('author', '-')),
         ("저자 소속", analysis_json.get('affiliation', '-')),
         ("발행년도", analysis_json.get('year', '-')),
@@ -315,7 +307,7 @@ def create_excel(paper_number, analysis_json, images, final_figures, final_table
             _write_row_dynamic(ws1, item, images, current_row, fig_style, content_style)
             current_row += 2
 
-            # Table 섹션
+    # Table 섹션
     if final_tables:
         current_row += 1
         ws1.write(current_row, 0, "Tables (표)", header_style)
@@ -335,8 +327,11 @@ def _write_row_dynamic(ws, item, images, row, label_fmt, content_fmt):
     clean_id = normalize_id(item.get('img_id'))
     target = next((img for img in images if img['id'] == clean_id), None)
 
-    ws.write(row, 0, item.get('real_label'), label_fmt)
-    ws.write(row, 1, f"📄 {item.get('caption')}", content_fmt)
+    label_text = item.get('real_label', 'Figure')
+    caption_text = item.get('caption', '설명 없음')
+
+    ws.write(row, 0, label_text, label_fmt)
+    ws.write(row, 1, f"📄 {caption_text}", content_fmt)
 
     img_row = row + 1
 
@@ -387,25 +382,19 @@ if uploaded_file and paper_num:
         if st.session_state.analyzed_data and st.session_state.analyzed_data['file_name'] == uploaded_file.name:
             st.success("⚡ 저장된 분석 결과를 불러옵니다.")
         else:
-            with st.spinner(f"[{SELECTED_MODEL_NAME}] 분석 중..."):
+            with st.spinner(f"[{SELECTED_MODEL_NAME}] 분석 중... (논문 전체 스캔 모드)"):
                 try:
-                    # 1. 텍스트 추출
-                    text, images = extract_data_from_pdf(uploaded_file)
+                    # 1. 텍스트 및 전체 페이지 이미지 추출
+                    text, images, all_page_imgs = extract_data_from_pdf(uploaded_file)
 
-                    # [디버깅] 추출된 텍스트가 비어있는지 확인
-                    if not text.strip():
-                        st.error("⚠️ PDF에서 텍스트를 추출하지 못했습니다. (스캔된 이미지 PDF이거나 암호화된 파일일 수 있습니다.)")
-                        st.stop()
+                    # 2. 텍스트 상태 확인 및 모드 결정
+                    if len(text.strip()) < 500:
+                        st.warning(f"⚠️ 텍스트 추출 실패! 논문 전체({len(all_page_imgs)}페이지)를 이미지로 읽습니다. 시간이 조금 더 걸릴 수 있습니다.")
                     else:
-                        with st.expander("🔍 디버깅: PDF에서 추출된 텍스트 확인 (앞부분 1000자)"):
-                            st.text(text[:1000])
+                        st.info("✅ 텍스트 추출 성공! 빠른 분석 모드로 실행합니다.")
 
-                    # 2. Gemini 분석 요청
-                    result = get_gemini_analysis(text, len(images))
-
-                    # [디버깅] AI 결과값 확인
-                    with st.expander("🔍 디버깅: AI가 반환한 원본 데이터 확인"):
-                        st.json(result)
+                    # 3. Gemini 분석 요청 (텍스트 부족 시 전체 이미지 전송)
+                    result = get_gemini_analysis(text, len(images), all_page_imgs)
 
                     if "error" in result:
                         st.error(f"AI 분석 오류: {result['error']}")
@@ -415,8 +404,6 @@ if uploaded_file and paper_num:
 
                         for item in ref_imgs:
                             label = item.get('real_label', 'Figure')
-
-                            # 'Table' 또는 '표'라는 단어가 들어가면 표로 분류
                             if "Table" in label or "표" in label:
                                 final_tbls.append(item)
                             else:
@@ -438,7 +425,7 @@ if uploaded_file and paper_num:
                             'figs': final_figs,
                             'tbls': final_tbls
                         }
-                        st.success("완료! 개조식 요약이 적용되었습니다.")
+                        st.success("완료! 분석이 끝났습니다.")
 
                 except Exception as e:
                     st.error(f"시스템 오류: {e}")
@@ -450,6 +437,6 @@ if uploaded_file and paper_num:
         st.download_button(
             label="📥 엑셀 파일 다운로드",
             data=excel_data,
-            file_name=f"Analysis_v6.0_{paper_num}.xlsx",
+            file_name=f"Analysis_v6.2_{paper_num}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
