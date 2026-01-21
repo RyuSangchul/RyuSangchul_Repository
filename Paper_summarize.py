@@ -17,9 +17,8 @@ st.set_page_config(page_title="논문 분석 Pro", layout="wide")
 # -----------------------------------------------------------
 # [2] 메인 UI
 # -----------------------------------------------------------
-# 버전 업데이트: 5.8 -> 5.9
-st.title("📑 논문 분석 Pro [ver5.9]")
-st.caption("✅ 이미지 내 텍스트(Fig/Table) 분석 | 구조 분석 보완")
+st.title("📑 논문 분석 Pro [ver5.91]")
+st.caption("✅ 이미지 내 텍스트(Fig/Table) 분석 | 개조식 요약 적용")
 
 # -----------------------------------------------------------
 # [3] 사이드바
@@ -62,12 +61,7 @@ with st.sidebar:
         st.error(f"모델 목록 오류: {e}")
         st.stop()
 
-    # [수정됨] 불필요한 '이미지 정밀 판독' 옵션 및 관련 UI 제거
-
 model = genai.GenerativeModel(SELECTED_MODEL_NAME)
-
-
-# [수정됨] vision_model 제거 (더 이상 사용하지 않음)
 
 
 # -----------------------------------------------------------
@@ -232,24 +226,32 @@ def extract_data_from_pdf(uploaded_file):
 
 
 def get_gemini_analysis(text, total_images):
+    # [수정됨] 프롬프트: 요약을 개조식으로 강제
     prompt = f"""
     너는 논문 분석 전문가야. 아래 텍스트를 읽고 JSON으로 추출해.
 
     [지시사항]
     1. **모든 내용은 한국어로 번역.**
-    2. 요약(summary)은 '최소 2문장 ~ 최대 5문장' 사이로 작성.
+    2. **요약(summary)은 반드시 '개조식(Bullet Points)'으로 작성할 것.**
+       - 서술형 줄글(Paragraph)을 쓰지 말고, 핵심 내용을 글머리 기호로 나열하세요.
+       - 각 요약 항목(intro, body, conclusion) 마다 3개~5개의 핵심 포인트를 작성하세요.
+       - 예시:
+         - 기존 방법의 문제점은 ~임.
+         - 이를 해결하기 위해 ~를 제안함.
     3. **이미지 매칭 시, 텍스트에 있는 `(Matched with ...)` 정보를 최우선으로 따를 것.**
 
     [요청 항목]
     0. title, author, affiliation, year, purpose
-    1. 요약 (intro, body, conclusion)
+    1. 요약 (intro, body, conclusion) - **반드시 개조식**
     2. key_images_desc, referenced_images
 
     [출력 포맷 JSON]
     {{
         "title": "...",
         "author": "...", "affiliation": "...", "year": "...", "purpose": "...",
-        "intro_summary": "- ...", "body_summary": "- ...", "conclusion_summary": "- ...",
+        "intro_summary": "- 핵심 내용 1\\n- 핵심 내용 2\\n- 핵심 내용 3", 
+        "body_summary": "- 연구 방법 1\\n- 실험 결과 2\\n- 분석 내용 3", 
+        "conclusion_summary": "- 결론 1\\n- 향후 과제 2",
         "key_images_desc": "...",
         "referenced_images": [ {{ "img_id": "Image_5", "real_label": "Figure 1", "caption": "설명" }} ]
     }}
@@ -390,7 +392,7 @@ if uploaded_file and paper_num:
                 try:
                     text, images = extract_data_from_pdf(uploaded_file)
 
-                    # [수정됨] Vision OCR 과정 제거 및 바로 Gemini 분석 요청
+                    # Gemini 분석 요청 (개조식 요약 포함)
                     result = get_gemini_analysis(text, len(images))
 
                     if "error" in result:
@@ -399,7 +401,6 @@ if uploaded_file and paper_num:
                         ref_imgs = result.get('referenced_images', [])
                         final_figs, final_tbls = [], []
 
-                        # [분류 로직] Gemini의 텍스트 분석 결과(real_label)에만 의존
                         for item in ref_imgs:
                             label = item.get('real_label', 'Figure')
 
@@ -425,7 +426,7 @@ if uploaded_file and paper_num:
                             'figs': final_figs,
                             'tbls': final_tbls
                         }
-                        st.success("완료! 분석이 끝났습니다.")
+                        st.success("완료! 개조식 요약이 적용되었습니다.")
 
                 except Exception as e:
                     st.error(f"오류: {e}")
@@ -437,6 +438,6 @@ if uploaded_file and paper_num:
         st.download_button(
             label="📥 엑셀 파일 다운로드",
             data=excel_data,
-            file_name=f"Analysis_v5.9_{paper_num}.xlsx",
+            file_name=f"Analysis_v6.0_{paper_num}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
