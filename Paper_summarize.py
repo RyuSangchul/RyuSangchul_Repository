@@ -15,8 +15,8 @@ st.set_page_config(page_title="논문 분석 Pro", layout="wide")
 # -----------------------------------------------------------
 # [2] 메인 UI
 # -----------------------------------------------------------
-st.title("📑 논문 분석 Pro [ver6.2 - Full Scan]")
-st.caption("✅ 글자가 깨지면 '논문 전체'를 이미지로 읽습니다. | 2.5 Flash 기본")
+st.title("📑 논문 분석 Pro [ver6.3 - Fix List Error]")
+st.caption("✅ 엑셀 변환 오류 수정 | 리스트 형태의 요약도 자동으로 변환하여 저장합니다.")
 
 # -----------------------------------------------------------
 # [3] 사이드바
@@ -40,7 +40,6 @@ with st.sidebar:
                 name = m.name.replace('models/', '')
                 available_models.append(name)
 
-        # [수정됨] 사용자 요청대로 2.5-flash를 최우선으로 배치
         preferred = ['gemini-2.5-flash', 'gemini-1.5-flash']
         available_models.sort(key=lambda x: (x not in preferred, x))
 
@@ -100,21 +99,16 @@ def extract_data_from_pdf(uploaded_file):
     final_text_content = ""
     image_counter = 1
 
-    # [v6.2 수정] 텍스트 실패 시 전체 페이지를 이미지로 읽기 위해 리스트 준비
     all_page_images = []
-
     all_captions = []
     all_images_info = []
 
-    # 1. 정보 수집 및 페이지 이미지 변환
     for page_num, page in enumerate(doc):
-        # 텍스트 추출
         text_blocks = page.get_text("blocks")
         for b in text_blocks:
             text = b[4].strip()
             final_text_content += text + "\n"
 
-            # 캡션 후보 식별
             if (text.startswith("Fig") or text.startswith("Table")) and len(text) < 500:
                 bbox = fitz.Rect(b[0], b[1], b[2], b[3])
                 cap_type = "Figure" if text.startswith("Fig") else "Table"
@@ -126,13 +120,10 @@ def extract_data_from_pdf(uploaded_file):
                     "type": cap_type, "label": label, "matched_img_id": None
                 })
 
-        # [v6.2 핵심] 모든 페이지를 이미지로 변환하여 저장 (해상도 적절히 조절)
-        # 메모리 절약을 위해 matrix는 1.0~1.5 정도로 설정
         pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
         img_data = Image.open(io.BytesIO(pix.tobytes("png")))
         all_page_images.append(img_data)
 
-        # 논문 내부 그림 추출 (기존 로직)
         image_list = page.get_images(full=True)
         raw_rects = []
         for img in image_list:
@@ -150,7 +141,6 @@ def extract_data_from_pdf(uploaded_file):
             })
             image_counter += 1
 
-    # 2. 위치 기반 매칭 (보조)
     for cap in all_captions:
         best_img = None
         min_score = float('inf')
@@ -178,7 +168,6 @@ def extract_data_from_pdf(uploaded_file):
             cap["matched_img_id"] = best_img["id"]
             best_img["matched_caption"] = cap["label"]
 
-    # 3. 최종 이미지 추출
     extracted_images_map = {}
     for img_info in all_images_info:
         page = doc[img_info["page"]]
@@ -209,7 +198,7 @@ def get_gemini_analysis(text, total_images, all_page_images):
 
     [지시사항]
     1. **모든 내용은 한국어로 번역.**
-    2. **요약(summary)은 반드시 '개조식(Bullet Points)'으로 작성.** (서술형 금지)
+    2. **요약(summary)은 반드시 '개조식(Bullet Points)'으로 작성.**
     3. 텍스트가 깨져 보인다면 함께 제공된 '페이지 이미지'들을 순서대로 읽어서 내용을 파악해.
     4. **모든 페이지의 이미지를 참고하여 서론부터 결론까지 빠짐없이 요약해.**
 
@@ -232,7 +221,6 @@ def get_gemini_analysis(text, total_images, all_page_images):
 
     inputs.append(prompt)
 
-    # [v6.2 개선] 텍스트가 유효한지 체크 후, 부족하면 전체 이미지를 전송
     is_text_valid = len(text.strip()) > 500
 
     if is_text_valid:
@@ -240,9 +228,7 @@ def get_gemini_analysis(text, total_images, all_page_images):
     else:
         inputs.append("[시스템 알림: 텍스트 추출 실패. 아래의 '전체 페이지 이미지'를 읽고 분석하세요.]")
 
-    # 텍스트가 부족하면 모든 페이지 이미지를 AI에게 제공
     if not is_text_valid:
-        # 너무 많을 경우를 대비해 최대 30페이지까지만 (용량/속도 고려)
         max_pages = 30
         for i, img in enumerate(all_page_images[:max_pages]):
             inputs.append(f"Page {i + 1} Image:")
@@ -292,11 +278,16 @@ def create_excel(paper_number, analysis_json, images, final_figures, final_table
 
     current_row = 1
     for label, content in data_map:
+        # [핵심 수정] AI가 리스트(List)로 반환할 경우, 줄바꿈 문자열로 변환하여 엑셀 에러 방지
+        if isinstance(content, list):
+            content = "\n".join(map(str, content))
+        elif content is None:
+            content = "-"
+
         ws1.write(current_row, 0, label, header_style)
-        ws1.write(current_row, 1, content, content_style)
+        ws1.write(current_row, 1, str(content), content_style)
         current_row += 1
 
-    # Figure 섹션
     if final_figures:
         current_row += 1
         ws1.write(current_row, 0, "Figures (그림)", header_style)
@@ -307,7 +298,6 @@ def create_excel(paper_number, analysis_json, images, final_figures, final_table
             _write_row_dynamic(ws1, item, images, current_row, fig_style, content_style)
             current_row += 2
 
-    # Table 섹션
     if final_tables:
         current_row += 1
         ws1.write(current_row, 0, "Tables (표)", header_style)
@@ -384,16 +374,13 @@ if uploaded_file and paper_num:
         else:
             with st.spinner(f"[{SELECTED_MODEL_NAME}] 분석 중... (논문 전체 스캔 모드)"):
                 try:
-                    # 1. 텍스트 및 전체 페이지 이미지 추출
                     text, images, all_page_imgs = extract_data_from_pdf(uploaded_file)
 
-                    # 2. 텍스트 상태 확인 및 모드 결정
                     if len(text.strip()) < 500:
                         st.warning(f"⚠️ 텍스트 추출 실패! 논문 전체({len(all_page_imgs)}페이지)를 이미지로 읽습니다. 시간이 조금 더 걸릴 수 있습니다.")
                     else:
                         st.info("✅ 텍스트 추출 성공! 빠른 분석 모드로 실행합니다.")
 
-                    # 3. Gemini 분석 요청 (텍스트 부족 시 전체 이미지 전송)
                     result = get_gemini_analysis(text, len(images), all_page_imgs)
 
                     if "error" in result:
@@ -437,6 +424,6 @@ if uploaded_file and paper_num:
         st.download_button(
             label="📥 엑셀 파일 다운로드",
             data=excel_data,
-            file_name=f"Analysis_v6.2_{paper_num}.xlsx",
+            file_name=f"Analysis_v6.3_{paper_num}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
