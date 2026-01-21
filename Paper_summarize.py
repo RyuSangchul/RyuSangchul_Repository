@@ -15,8 +15,8 @@ st.set_page_config(page_title="논문 분석 Pro", layout="wide")
 # -----------------------------------------------------------
 # [2] 메인 UI
 # -----------------------------------------------------------
-st.title("📑 논문 분석 Pro [ver6.3 - Fix List Error]")
-st.caption("✅ 엑셀 변환 오류 수정 | 리스트 형태의 요약도 자동으로 변환하여 저장합니다.")
+st.title("📑 논문 분석 Pro [ver6.4 - Classification Fix]")
+st.caption("✅ Figure/Table 구분 강화 | 번호(1, 2, 3) 자동 정렬 기능 추가")
 
 # -----------------------------------------------------------
 # [3] 사이드바
@@ -59,11 +59,41 @@ model = genai.GenerativeModel(SELECTED_MODEL_NAME)
 
 
 # -----------------------------------------------------------
-# [4] 유틸리티 함수
+# [4] 유틸리티 함수 (강화됨)
 # -----------------------------------------------------------
 def normalize_id(ref_text):
+    """Image_1 -> Image_1 변환"""
     nums = re.findall(r'\d+', str(ref_text))
     return f"Image_{nums[0]}" if nums else None
+
+
+def standardize_label(label_text):
+    """
+    [핵심 기능] 라벨 텍스트를 분석해서 (타입, 번호) 튜플을 반환합니다.
+    예: "Fig. 3 결과 그래프" -> ("Figure", 3, "Fig. 3 결과 그래프")
+    예: "Table 2. 실험 조건" -> ("Table", 2, "Table 2. 실험 조건")
+    """
+    if not label_text:
+        return ("Unknown", 999, "Unknown")
+
+    label_upper = str(label_text).upper()
+
+    # 1. 타입 결정
+    detected_type = "Figure"  # 기본값
+    if "TAB" in label_upper or "표" in label_upper:
+        detected_type = "Table"
+    elif "FIG" in label_upper or "그림" in label_upper:
+        detected_type = "Figure"
+
+    # 2. 번호 추출 (숫자 찾기)
+    # "Figure 1", "Fig.1", "Table-3" 등에서 숫자만 뽑음
+    nums = re.findall(r'\d+', label_text)
+    if nums:
+        detected_num = int(nums[0])
+    else:
+        detected_num = 999  # 숫자가 없으면 맨 뒤로 보냄
+
+    return (detected_type, detected_num, label_text)
 
 
 def merge_nearby_rectangles(rects, distance=20):
@@ -109,10 +139,15 @@ def extract_data_from_pdf(uploaded_file):
             text = b[4].strip()
             final_text_content += text + "\n"
 
-            if (text.startswith("Fig") or text.startswith("Table")) and len(text) < 500:
+            # 캡션 후보 식별 (Fig 또는 Table로 시작하는 짧은 문장)
+            if (text.startswith("Fig") or text.startswith("Table") or text.startswith("그림") or text.startswith(
+                    "표")) and len(text) < 500:
                 bbox = fitz.Rect(b[0], b[1], b[2], b[3])
-                cap_type = "Figure" if text.startswith("Fig") else "Table"
-                label_match = re.match(r"(Fig\.?|Table)\s*\d+", text)
+
+                cap_type = "Table" if (text.startswith("Table") or text.startswith("표")) else "Figure"
+
+                # 라벨 추출 (예: Fig. 1)
+                label_match = re.match(r"(Fig\.?|Figure|Table|그림|표)\s*\d+", text, re.IGNORECASE)
                 label = label_match.group(0) if label_match else cap_type
 
                 all_captions.append({
@@ -120,10 +155,12 @@ def extract_data_from_pdf(uploaded_file):
                     "type": cap_type, "label": label, "matched_img_id": None
                 })
 
+        # 페이지 이미지 저장 (AI 전송용)
         pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
         img_data = Image.open(io.BytesIO(pix.tobytes("png")))
         all_page_images.append(img_data)
 
+        # 논문 내부 이미지 좌표 추출
         image_list = page.get_images(full=True)
         raw_rects = []
         for img in image_list:
@@ -141,15 +178,15 @@ def extract_data_from_pdf(uploaded_file):
             })
             image_counter += 1
 
+    # 캡션 매칭 (위치 기반)
     for cap in all_captions:
         best_img = None
         min_score = float('inf')
         candidates = [img for img in all_images_info if img["page"] == cap["page"] and img["matched_caption"] is None]
 
         for img in candidates:
-            if cap["type"] == "Figure" and cap["bbox"].y0 < img["bbox"].y1: continue
-            if cap["type"] == "Table" and cap["bbox"].y1 > img["bbox"].y0: continue
-
+            # Figure는 보통 캡션이 아래, Table은 보통 캡션이 위에 있음 (일반적 규칙)
+            # 하지만 엄격하게 제한하지 않고 거리 점수로 판단
             v_dist = max(0, cap["bbox"].y0 - img["bbox"].y1) if cap["type"] == "Figure" else max(0,
                                                                                                  img["bbox"].y0 - cap[
                                                                                                      "bbox"].y1)
@@ -168,6 +205,7 @@ def extract_data_from_pdf(uploaded_file):
             cap["matched_img_id"] = best_img["id"]
             best_img["matched_caption"] = cap["label"]
 
+    # 최종 이미지 맵 생성
     extracted_images_map = {}
     for img_info in all_images_info:
         page = doc[img_info["page"]]
@@ -179,7 +217,8 @@ def extract_data_from_pdf(uploaded_file):
         img_bytes = pix.tobytes("png")
 
         img_id = img_info["id"]
-        initial_label = img_info["matched_caption"] if img_info["matched_caption"] else "Figure"
+        # 캡션 매칭된 것이 있으면 그것을 우선 사용
+        initial_label = img_info["matched_caption"] if img_info["matched_caption"] else "Unknown"
 
         extracted_images_map[img_id] = {
             "id": img_id, "page": img_info["page"] + 1, "bytes": img_bytes,
@@ -193,19 +232,23 @@ def extract_data_from_pdf(uploaded_file):
 def get_gemini_analysis(text, total_images, all_page_images):
     inputs = []
 
+    # [프롬프트 강화] 분류 및 번호 인식을 강력하게 지시
     prompt = f"""
-    너는 논문 분석 전문가야. 제공된 자료(텍스트 또는 이미지)를 보고 JSON으로 추출해.
+    너는 논문 분석 전문가야. 제공된 자료를 보고 JSON을 추출해.
 
-    [지시사항]
-    1. **모든 내용은 한국어로 번역.**
-    2. **요약(summary)은 반드시 '개조식(Bullet Points)'으로 작성.**
-    3. 텍스트가 깨져 보인다면 함께 제공된 '페이지 이미지'들을 순서대로 읽어서 내용을 파악해.
-    4. **모든 페이지의 이미지를 참고하여 서론부터 결론까지 빠짐없이 요약해.**
+    [핵심 지시사항]
+    1. **요약(summary)은 반드시 '개조식(Bullet Points)'으로 작성.**
+    2. **이미지 분류(Classification)를 정확히 수행해.**
+       - 이미지 내용을 보고 **'Figure(그림/그래프)'**인지 **'Table(표)'**인지 판단해.
+       - 텍스트에 "Table 1", "Figure 3" 같은 번호가 있다면 그 번호를 반드시 `real_label`에 적어.
+       - 예시: `real_label`: "Figure 1", `real_label`: "Table 2"
+    3. 텍스트가 깨져 보이면 제공된 '페이지 이미지'를 읽어서 내용을 파악해.
 
     [요청 항목]
     0. title, author, affiliation, year, purpose
     1. 요약 (intro_summary, body_summary, conclusion_summary)
-    2. key_images_desc, referenced_images
+    2. key_images_desc
+    3. referenced_images (여기에 각 이미지의 ID와 정확한 라벨을 적어줘)
 
     [출력 포맷 JSON]
     {{
@@ -215,7 +258,10 @@ def get_gemini_analysis(text, total_images, all_page_images):
         "body_summary": "- ...", 
         "conclusion_summary": "- ...",
         "key_images_desc": "...",
-        "referenced_images": [ {{ "img_id": "Image_5", "real_label": "Figure 1", "caption": "설명" }} ]
+        "referenced_images": [ 
+            {{ "img_id": "Image_1", "real_label": "Figure 1", "caption": "설명" }},
+            {{ "img_id": "Image_2", "real_label": "Table 1", "caption": "설명" }}
+        ]
     }}
     """
 
@@ -234,7 +280,7 @@ def get_gemini_analysis(text, total_images, all_page_images):
             inputs.append(f"Page {i + 1} Image:")
             inputs.append(img)
         if len(all_page_images) > max_pages:
-            inputs.append("[System: 뒷부분 페이지 일부 생략됨 (용량 제한)]")
+            inputs.append("[System: 뒷부분 페이지 일부 생략됨]")
 
     try:
         response = model.generate_content(inputs, generation_config={"response_mime_type": "application/json"})
@@ -278,7 +324,7 @@ def create_excel(paper_number, analysis_json, images, final_figures, final_table
 
     current_row = 1
     for label, content in data_map:
-        # [핵심 수정] AI가 리스트(List)로 반환할 경우, 줄바꿈 문자열로 변환하여 엑셀 에러 방지
+        # 리스트 에러 방지
         if isinstance(content, list):
             content = "\n".join(map(str, content))
         elif content is None:
@@ -288,6 +334,7 @@ def create_excel(paper_number, analysis_json, images, final_figures, final_table
         ws1.write(current_row, 1, str(content), content_style)
         current_row += 1
 
+    # Figure 섹션 쓰기
     if final_figures:
         current_row += 1
         ws1.write(current_row, 0, "Figures (그림)", header_style)
@@ -298,6 +345,7 @@ def create_excel(paper_number, analysis_json, images, final_figures, final_table
             _write_row_dynamic(ws1, item, images, current_row, fig_style, content_style)
             current_row += 2
 
+    # Table 섹션 쓰기
     if final_tables:
         current_row += 1
         ws1.write(current_row, 0, "Tables (표)", header_style)
@@ -372,12 +420,12 @@ if uploaded_file and paper_num:
         if st.session_state.analyzed_data and st.session_state.analyzed_data['file_name'] == uploaded_file.name:
             st.success("⚡ 저장된 분석 결과를 불러옵니다.")
         else:
-            with st.spinner(f"[{SELECTED_MODEL_NAME}] 분석 중... (논문 전체 스캔 모드)"):
+            with st.spinner(f"[{SELECTED_MODEL_NAME}] 분석 중... (정밀 분류 모드)"):
                 try:
                     text, images, all_page_imgs = extract_data_from_pdf(uploaded_file)
 
                     if len(text.strip()) < 500:
-                        st.warning(f"⚠️ 텍스트 추출 실패! 논문 전체({len(all_page_imgs)}페이지)를 이미지로 읽습니다. 시간이 조금 더 걸릴 수 있습니다.")
+                        st.warning(f"⚠️ 텍스트 추출 실패! 논문 전체({len(all_page_imgs)}페이지)를 이미지로 읽습니다.")
                     else:
                         st.info("✅ 텍스트 추출 성공! 빠른 분석 모드로 실행합니다.")
 
@@ -389,21 +437,24 @@ if uploaded_file and paper_num:
                         ref_imgs = result.get('referenced_images', [])
                         final_figs, final_tbls = [], []
 
+                        # [분류 로직 강화]
                         for item in ref_imgs:
-                            label = item.get('real_label', 'Figure')
-                            if "Table" in label or "표" in label:
+                            raw_label = item.get('real_label', 'Unknown')
+
+                            # standardize_label 함수를 통해 (타입, 번호, 원본라벨) 분리
+                            detected_type, detected_num, _ = standardize_label(raw_label)
+
+                            # 정렬을 위해 번호 정보를 item에 추가
+                            item['sort_num'] = detected_num
+
+                            if detected_type == "Table":
                                 final_tbls.append(item)
                             else:
                                 final_figs.append(item)
 
-
-                        def sort_key(x):
-                            nums = re.findall(r'\d+', x.get('real_label', '0'))
-                            return int(nums[0]) if nums else 999
-
-
-                        final_figs.sort(key=sort_key)
-                        final_tbls.sort(key=sort_key)
+                        # 정렬: 번호 순서대로 (1, 2, 3...)
+                        final_figs.sort(key=lambda x: x['sort_num'])
+                        final_tbls.sort(key=lambda x: x['sort_num'])
 
                         st.session_state.analyzed_data = {
                             'file_name': uploaded_file.name,
@@ -424,6 +475,6 @@ if uploaded_file and paper_num:
         st.download_button(
             label="📥 엑셀 파일 다운로드",
             data=excel_data,
-            file_name=f"Analysis_v6.3_{paper_num}.xlsx",
+            file_name=f"Analysis_v6.4_{paper_num}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
