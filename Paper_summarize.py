@@ -15,8 +15,8 @@ st.set_page_config(page_title="논문 분석 Pro", layout="wide")
 # -----------------------------------------------------------
 # [2] 메인 UI
 # -----------------------------------------------------------
-st.title("📑 논문 분석 Pro [ver6.8 - Fine Filter]")
-st.caption("✅ 이미지 필터 완화 (30px 이하만 삭제) | 놓치는 그림 없이 최대한 수집 | 한글 출력")
+st.title("📑 논문 분석 Pro [ver6.9 - Context Crop]")
+st.caption("✅ Figure(위쪽 캡처) / Table(아래쪽 캡처) 문맥 인식 | 30px 이하 자동 삭제 | 한글 출력")
 
 # -----------------------------------------------------------
 # [3] 사이드바
@@ -67,15 +67,10 @@ def normalize_id(ref_text):
 
 
 def standardize_label_to_korean(label_text):
-    """
-    라벨을 분석해서 한글로 변환 (Figure 1 -> 그림 1)
-    """
-    if not label_text:
-        return ("Unknown", 999, "미분류")
+    """ 라벨을 분석해서 한글로 변환 (Figure 1 -> 그림 1) """
+    if not label_text: return ("Unknown", 999, "미분류")
 
     label_upper = str(label_text).upper()
-
-    # 1. 타입 결정 및 한글 변환
     detected_type = "Figure"
     korean_prefix = "그림"
 
@@ -86,7 +81,6 @@ def standardize_label_to_korean(label_text):
         detected_type = "Figure"
         korean_prefix = "그림"
 
-    # 2. 번호 추출
     nums = re.findall(r'\d+', label_text)
     if nums:
         detected_num = int(nums[0])
@@ -98,31 +92,8 @@ def standardize_label_to_korean(label_text):
     return (detected_type, detected_num, final_label)
 
 
-def merge_nearby_rectangles(rects, distance=20):
-    if not rects: return []
-    rects.sort(key=lambda r: (r.y0, r.x0))
-    merged = []
-    while rects:
-        current = rects.pop(0)
-        has_merged = True
-        while has_merged:
-            has_merged = False
-            rest = []
-            for r in rects:
-                expanded_current = fitz.Rect(current.x0 - distance, current.y0 - distance,
-                                             current.x1 + distance, current.y1 + distance)
-                if expanded_current.intersects(r):
-                    current = current | r
-                    has_merged = True
-                else:
-                    rest.append(r)
-            rects = rest
-        merged.append(current)
-    return merged
-
-
 # -----------------------------------------------------------
-# [5] 핵심 로직 함수 (필터 완화)
+# [5] 핵심 로직 함수 (문맥 기반 캡처)
 # -----------------------------------------------------------
 def extract_data_from_pdf(uploaded_file):
     pdf_bytes = uploaded_file.getvalue()
@@ -132,112 +103,103 @@ def extract_data_from_pdf(uploaded_file):
     image_counter = 1
 
     all_page_images = []
-    all_captions = []
-    all_images_info = []
+    extracted_images_map = {}
 
     for page_num, page in enumerate(doc):
-        # 1. 텍스트 추출 및 캡션 위치 찾기
-        text_blocks = page.get_text("blocks")
-        for b in text_blocks:
-            text = b[4].strip()
-            final_text_content += text + "\n"
+        # 1. 페이지 전체 텍스트 블록 가져오기 (정렬됨)
+        # blocks structure: (x0, y0, x1, y1, text, block_no, block_type)
+        blocks = page.get_text("blocks")
+        blocks.sort(key=lambda b: b[1])  # y0(세로) 기준으로 정렬
 
-            # 캡션 인식
-            if re.match(r"^(Fig|Figure|Table|그림|표)\s*\.?\s*\d+", text, re.IGNORECASE) and len(text) < 300:
-                bbox = fitz.Rect(b[0], b[1], b[2], b[3])
-                cap_type = "Table" if (text.startswith("Table") or text.startswith("표")) else "Figure"
-                label_match = re.match(r"(Fig\.?|Figure|Table|그림|표)\s*\d+", text, re.IGNORECASE)
-                label = label_match.group(0) if label_match else cap_type
+        final_text_content += page.get_text() + "\n"
 
-                all_captions.append({
-                    "page": page_num, "bbox": bbox, "text": text,
-                    "type": cap_type, "label": label, "matched_img_id": None
-                })
-
-        # 2. 페이지 이미지 저장
+        # AI 분석용 전체 페이지 이미지
         pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
         img_data = Image.open(io.BytesIO(pix.tobytes("png")))
         all_page_images.append(img_data)
 
-        # 3. 이미지 추출 (필터 완화: 30px)
-        image_list = page.get_images(full=True)
-        raw_rects = []
+        # 2. 캡션 식별 및 영역 계산
+        for i, block in enumerate(blocks):
+            text = block[4].strip()
+            bbox = fitz.Rect(block[0], block[1], block[2], block[3])
 
-        for img in image_list:
-            xref = img[0]
-            try:
-                img_rects = page.get_image_rects(xref)
-                for r in img_rects:
-                    # [사용자 요청 수정] 30px 미만만 버림 (이전 100px은 너무 컸음)
-                    if r.width < 30 or r.height < 30:
+            # 캡션인지 확인 (Fig, Table)
+            # 조건: 문장이 짧고(300자 이하), Fig/Table로 시작
+            if len(text) < 300 and re.match(r"^(Fig|Figure|Table|그림|표)\s*[\.|\s]\s*\d+", text, re.IGNORECASE):
+
+                is_table = "Table" in text or "표" in text or "TABLE" in text.upper()
+
+                # 라벨 추출 (예: Fig. 1)
+                label_match = re.match(r"(Fig\.?|Figure|Table|그림|표)\s*\d+", text, re.IGNORECASE)
+                real_label = label_match.group(0) if label_match else text[:15]
+
+                crop_rect = None
+                page_rect = page.rect
+
+                # --- [A] Table 로직 (캡션이 위, 내용은 아래) ---
+                if is_table:
+                    # Top: 캡션의 바닥(y1)
+                    top_y = bbox.y1
+                    # Bottom: '다음' 텍스트 블록의 천장(y0) 찾기
+                    bottom_y = page_rect.y1 - 50  # 기본값: 페이지 끝
+
+                    if i + 1 < len(blocks):
+                        next_block = blocks[i + 1]
+                        # 다음 블록이 너무 가까우면(같은 캡션의 일부일 수 있음), 그 다음을 봄
+                        if next_block[1] - bbox.y1 < 10:
+                            if i + 2 < len(blocks):
+                                bottom_y = blocks[i + 2][1]
+                        else:
+                            bottom_y = next_block[1]
+
+                    # 캡처 영역 설정 (좌우는 페이지 전체 사용 - 2단 편집 대응)
+                    crop_rect = fitz.Rect(page_rect.x0 + 20, top_y, page_rect.x1 - 20, bottom_y)
+
+                # --- [B] Figure 로직 (캡션이 아래, 내용은 위) ---
+                else:  # Figure
+                    # Bottom: 캡션의 천장(y0)
+                    bottom_y = bbox.y0
+                    # Top: '이전' 텍스트 블록의 바닥(y1) 찾기
+                    top_y = page_rect.y0 + 50  # 기본값: 페이지 시작
+
+                    if i - 1 >= 0:
+                        prev_block = blocks[i - 1]
+                        # 이전 블록과의 거리가 너무 멀면(다른 단락), 그 블록 아래부터 시작
+                        top_y = prev_block[3]
+
+                    # 캡처 영역 설정
+                    crop_rect = fitz.Rect(page_rect.x0 + 20, top_y, page_rect.x1 - 20, bottom_y)
+
+                # --- 3. 이미지 캡처 및 저장 ---
+                if crop_rect:
+                    # 유효성 검사 (높이가 너무 작거나 음수면 스킵)
+                    if crop_rect.height < 30:
                         continue
-                    raw_rects.append(r)
-            except:
-                continue
 
-        # 겹치는 이미지 영역 병합 (작은 조각들을 하나로 합침)
-        merged_rects = merge_nearby_rectangles(raw_rects, distance=20)
+                    try:
+                        clip_pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=crop_rect)
 
-        for rect in merged_rects:
-            img_id = f"Image_{image_counter}"
-            all_images_info.append({
-                "id": img_id, "page": page_num, "bbox": rect, "matched_caption": None
-            })
-            image_counter += 1
+                        # [필터] 30px 이하 이미지는 버림 (빈 공간, 노이즈)
+                        if clip_pix.width < 30 or clip_pix.height < 30:
+                            continue
 
-    # 4. 캡션과 이미지 매칭
-    for cap in all_captions:
-        best_img = None
-        min_score = float('inf')
+                        # 흰색 배경인지 확인 (내용이 없는지) - 선택적
+                        # (복잡도를 줄이기 위해 여기선 생략하고 일단 저장)
 
-        candidates = [img for img in all_images_info if img["page"] == cap["page"] and img["matched_caption"] is None]
+                        img_bytes = clip_pix.tobytes("png")
+                        img_id = f"Image_{image_counter}"
+                        image_counter += 1
 
-        for img in candidates:
-            if cap["type"] == "Figure":
-                v_dist = (cap["bbox"].y0 - img["bbox"].y1)
-            else:
-                v_dist = (img["bbox"].y0 - cap["bbox"].y1)
-
-            if v_dist < -50: continue
-
-            abs_v_dist = abs(v_dist)
-            cap_center_x = (cap["bbox"].x0 + cap["bbox"].x1) / 2
-            img_center_x = (img["bbox"].x0 + img["bbox"].x1) / 2
-            h_align_dist = abs(cap_center_x - img_center_x)
-
-            total_score = abs_v_dist + (h_align_dist * 0.5)
-
-            if total_score < min_score:
-                min_score = total_score
-                best_img = img
-
-        if best_img:
-            cap["matched_img_id"] = best_img["id"]
-            best_img["matched_caption"] = cap["label"]
-
-    # 5. 최종 이미지 추출 및 저장
-    extracted_images_map = {}
-    for img_info in all_images_info:
-        page = doc[img_info["page"]]
-        rect = img_info["bbox"]
-
-        padding = 10
-        clip_rect = fitz.Rect(rect.x0 - padding, rect.y0 - padding, rect.x1 + padding, rect.y1 + padding) & page.rect
-
-        try:
-            mat = fitz.Matrix(2, 2)
-            pix = page.get_pixmap(matrix=mat, clip=clip_rect)
-            img_bytes = pix.tobytes("png")
-
-            img_id = img_info["id"]
-            initial_label = img_info["matched_caption"] if img_info["matched_caption"] else "Figure"
-
-            extracted_images_map[img_id] = {
-                "id": img_id, "page": img_info["page"] + 1, "bytes": img_bytes,
-                "initial_label": initial_label, "real_label": initial_label
-            }
-        except:
-            continue
+                        extracted_images_map[img_id] = {
+                            "id": img_id,
+                            "page": page_num + 1,
+                            "bytes": img_bytes,
+                            "initial_label": text,
+                            "real_label": real_label
+                        }
+                    except Exception as e:
+                        print(f"Crop Error: {e}")
+                        continue
 
     extracted_images = list(extracted_images_map.values())
     return final_text_content, extracted_images, all_page_images
@@ -253,8 +215,8 @@ def get_gemini_analysis(text, total_images, all_page_images):
     1. **모든 요약(Summary)은 반드시 '한국어(Korean)'로 작성해.**
     2. **요약은 '개조식(Bullet Points)'으로 작성해.**
     3. **이미지 매칭:**
-       - `referenced_images` 리스트를 만들 때, 내가 제공한 이미지 리스트의 `real_label`(예: 그림 1)과 정확히 매칭해.
-       - 만약 매칭되는 이미지가 없다면 억지로 넣지 마.
+       - `referenced_images`의 `real_label`(예: 그림 1)은 텍스트에 있는 번호와 정확히 일치해야 해.
+       - 내가 잘라낸 이미지(`Image_X`)가 해당 그림 번호와 맞는지 확인하고 매칭해.
 
     [요청 항목]
     0. title, author, affiliation, year, purpose
@@ -425,14 +387,14 @@ if uploaded_file and paper_num:
         if st.session_state.analyzed_data and st.session_state.analyzed_data['file_name'] == uploaded_file.name:
             st.success("⚡ 저장된 분석 결과를 불러옵니다.")
         else:
-            with st.spinner(f"[{SELECTED_MODEL_NAME}] 분석 중... (30px 이하만 삭제)"):
+            with st.spinner(f"[{SELECTED_MODEL_NAME}] 분석 중... (문맥 인식 캡처)"):
                 try:
                     text, images, all_page_imgs = extract_data_from_pdf(uploaded_file)
 
                     if len(text.strip()) < 500:
                         st.warning("⚠️ 텍스트 추출이 불안정하여 전체 페이지 분석을 병행합니다.")
                     else:
-                        st.info(f"✅ 텍스트 및 {len(images)}개의 이미지 추출 완료!")
+                        st.info(f"✅ 텍스트 및 {len(images)}개의 주요 영역(Context Crop) 추출 완료!")
 
                     result = get_gemini_analysis(text, len(images), all_page_imgs)
 
@@ -464,7 +426,7 @@ if uploaded_file and paper_num:
                             'figs': final_figs,
                             'tbls': final_tbls
                         }
-                        st.success("완료! 분석이 끝났습니다.")
+                        st.success("완료! 캡션 위치를 기준으로 그림과 표를 잘라왔습니다.")
 
                 except Exception as e:
                     st.error(f"시스템 오류: {e}")
@@ -476,6 +438,6 @@ if uploaded_file and paper_num:
         st.download_button(
             label="📥 엑셀 파일 다운로드",
             data=excel_data,
-            file_name=f"Analysis_v6.8_{paper_num}.xlsx",
+            file_name=f"Analysis_v6.9_{paper_num}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
