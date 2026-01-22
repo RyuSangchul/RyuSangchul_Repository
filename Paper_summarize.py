@@ -15,8 +15,8 @@ st.set_page_config(page_title="논문 분석 Pro", layout="wide")
 # -----------------------------------------------------------
 # [2] 메인 UI
 # -----------------------------------------------------------
-st.title("📑 논문 분석 Pro [ver7.2 - Force Capture]")
-st.caption("✅ 이미지가 없으면 '강제 영역 캡처' 실행 | 2단 레이아웃 오버랩 탐색 | 한글 출력")
+st.title("📑 논문 분석 Pro [ver7.3 - Caption Included]")
+st.caption("✅ 캡션(Fig. 1 / Table 1) 글자 포함 캡처 | 2단 레이아웃 대응 | 한글 출력")
 
 # -----------------------------------------------------------
 # [3] 사이드바
@@ -92,7 +92,7 @@ def standardize_label_to_korean(label_text):
 
 
 # -----------------------------------------------------------
-# [5] 핵심 로직 함수 (강제 캡처 기능 추가)
+# [5] 핵심 로직 함수 (캡션 포함 캡처)
 # -----------------------------------------------------------
 def extract_data_from_pdf(uploaded_file):
     pdf_bytes = uploaded_file.getvalue()
@@ -122,7 +122,7 @@ def extract_data_from_pdf(uploaded_file):
             text = block[4].strip()
             bbox = fitz.Rect(block[0], block[1], block[2], block[3])
 
-            # 캡션 인식 (Regex 완화: ^ 제거)
+            # 캡션 인식
             if len(text) < 300 and re.search(r"(Fig|Figure|Table|그림|표)\s*[\.|\s]\s*\d+", text, re.IGNORECASE):
 
                 is_table = "Table" in text or "표" in text or "TABLE" in text.upper()
@@ -133,27 +133,25 @@ def extract_data_from_pdf(uploaded_file):
                 # --- 2단 레이아웃 영역 설정 ---
                 caption_center_x = (bbox.x0 + bbox.x1) / 2
 
-                # [개선] 중앙 오버랩 적용 (칼같이 자르지 않음)
                 if caption_center_x < page_center_x:  # 왼쪽 단
                     search_x_min = 0
-                    search_x_max = page_center_x * 1.1  # 중앙을 조금 넘어가도 허용
+                    search_x_max = page_center_x * 1.1
                 else:  # 오른쪽 단
-                    search_x_min = page_center_x * 0.9  # 중앙 조금 전부터 시작
+                    search_x_min = page_center_x * 0.9
                     search_x_max = page_width
 
-                # 캡션이 페이지 중앙에 걸쳐 있으면 전체 너비 사용
                 if (bbox.x1 - bbox.x0) > (page_width * 0.6):
                     search_x_min = 0
                     search_x_max = page_width
 
                 crop_rect = None
 
-                # --- [A] Table (캡션 아래) ---
+                # --- [A] Table (캡션 포함: 위쪽 확장) ---
                 if is_table:
-                    top_y = bbox.y1
+                    # [수정됨] Top: 캡션 글자 위쪽(bbox.y0) - 여유분 5px
+                    top_y = max(0, bbox.y0 - 5)
                     bottom_y = page.rect.y1 - 30
 
-                    # 텍스트 장벽 찾기
                     barrier_found = False
                     closest_next_block_y = bottom_y
 
@@ -161,26 +159,25 @@ def extract_data_from_pdf(uploaded_file):
                         if other_block == block: continue
                         o_bbox = fitz.Rect(other_block[0], other_block[1], other_block[2], other_block[3])
 
-                        # 같은 단에 있고, 캡션보다 아래에 있는가?
-                        if (o_bbox.x1 > search_x_min and o_bbox.x0 < search_x_max) and (o_bbox.y0 > top_y + 5):
+                        # 캡션보다 아래에 있는 텍스트 블록 찾기
+                        if (o_bbox.x1 > search_x_min and o_bbox.x0 < search_x_max) and (o_bbox.y0 > bbox.y1 + 5):
                             if o_bbox.y0 < closest_next_block_y:
                                 closest_next_block_y = o_bbox.y0
                                 barrier_found = True
 
-                    # [안전장치] 장벽을 못 찾았거나 너무 멀면 강제 높이 지정
                     if not barrier_found or (closest_next_block_y - top_y > 500):
-                        bottom_y = min(page.rect.y1, top_y + 350)  # 350px 강제 캡처
+                        bottom_y = min(page.rect.y1, top_y + 350)
                     else:
                         bottom_y = closest_next_block_y
 
                     crop_rect = fitz.Rect(search_x_min, top_y, search_x_max, bottom_y)
 
-                # --- [B] Figure (캡션 위) ---
+                # --- [B] Figure (캡션 포함: 아래쪽 확장) ---
                 else:
-                    bottom_y = bbox.y0
+                    # [수정됨] Bottom: 캡션 글자 아래쪽(bbox.y1) + 여유분 5px
+                    bottom_y = min(page.rect.y1, bbox.y1 + 5)
                     top_y = page.rect.y0 + 30
 
-                    # 텍스트 장벽 찾기
                     barrier_found = False
                     closest_prev_block_y = top_y
 
@@ -188,26 +185,24 @@ def extract_data_from_pdf(uploaded_file):
                         if other_block == block: continue
                         o_bbox = fitz.Rect(other_block[0], other_block[1], other_block[2], other_block[3])
 
-                        # 같은 단에 있고, 캡션보다 위에 있는가?
-                        if (o_bbox.x1 > search_x_min and o_bbox.x0 < search_x_max) and (o_bbox.y1 < bottom_y - 5):
+                        # 캡션보다 위에 있는 텍스트 블록 찾기 (주의: bbox.y0 기준 위쪽)
+                        if (o_bbox.x1 > search_x_min and o_bbox.x0 < search_x_max) and (o_bbox.y1 < bbox.y0 - 5):
                             if o_bbox.y1 > closest_prev_block_y:
                                 closest_prev_block_y = o_bbox.y1
                                 barrier_found = True
 
-                    # [안전장치] 장벽을 못 찾았거나 너무 멀면 강제 높이 지정
                     if not barrier_found or (bottom_y - closest_prev_block_y > 500):
-                        top_y = max(page.rect.y0, bottom_y - 350)  # 위로 350px 강제 캡처
+                        top_y = max(page.rect.y0, bottom_y - 350)
                     else:
                         top_y = closest_prev_block_y
 
                     crop_rect = fitz.Rect(search_x_min, top_y, search_x_max, bottom_y)
 
                 # --- 3. 이미지 캡처 ---
-                if crop_rect and crop_rect.height > 10:  # 최소 10px
+                if crop_rect and crop_rect.height > 10:
                     try:
                         clip_pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=crop_rect)
 
-                        # [필터 완화] 30px 이하는 버리지만, 혹시 모르니 로깅
                         if clip_pix.width < 30 or clip_pix.height < 30:
                             continue
 
@@ -412,14 +407,14 @@ if uploaded_file and paper_num:
         if st.session_state.analyzed_data and st.session_state.analyzed_data['file_name'] == uploaded_file.name:
             st.success("⚡ 저장된 분석 결과를 불러옵니다.")
         else:
-            with st.spinner(f"[{SELECTED_MODEL_NAME}] 분석 중... (강제 캡처 모드)"):
+            with st.spinner(f"[{SELECTED_MODEL_NAME}] 분석 중... (캡션 글자 포함)"):
                 try:
                     text, images, all_page_imgs = extract_data_from_pdf(uploaded_file)
 
                     if len(text.strip()) < 500:
                         st.warning("⚠️ 텍스트 추출이 불안정하여 전체 페이지 분석을 병행합니다.")
                     else:
-                        st.info(f"✅ 텍스트 및 {len(images)}개의 이미지(Force Crop) 추출 완료!")
+                        st.info(f"✅ 텍스트 및 {len(images)}개의 이미지(글자 포함) 추출 완료!")
 
                     result = get_gemini_analysis(text, len(images), all_page_imgs)
 
@@ -463,6 +458,6 @@ if uploaded_file and paper_num:
         st.download_button(
             label="📥 엑셀 파일 다운로드",
             data=excel_data,
-            file_name=f"Analysis_v7.2_{paper_num}.xlsx",
+            file_name=f"Analysis_v7.3_{paper_num}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
