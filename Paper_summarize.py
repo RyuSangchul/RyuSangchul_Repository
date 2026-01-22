@@ -15,8 +15,8 @@ st.set_page_config(page_title="논문 분석 Pro", layout="wide")
 # -----------------------------------------------------------
 # [2] 메인 UI
 # -----------------------------------------------------------
-st.title("📑 논문 분석 Pro [ver7.1 - 2-Column Expert]")
-st.caption("✅ 2단 레이아웃 완벽 대응 | 중앙선 기준 좌우 분리 캡처 | 텍스트 뭉치 회피")
+st.title("📑 논문 분석 Pro [ver7.2 - Force Capture]")
+st.caption("✅ 이미지가 없으면 '강제 영역 캡처' 실행 | 2단 레이아웃 오버랩 탐색 | 한글 출력")
 
 # -----------------------------------------------------------
 # [3] 사이드바
@@ -92,7 +92,7 @@ def standardize_label_to_korean(label_text):
 
 
 # -----------------------------------------------------------
-# [5] 핵심 로직 함수 (2단 레이아웃 대응)
+# [5] 핵심 로직 함수 (강제 캡처 기능 추가)
 # -----------------------------------------------------------
 def extract_data_from_pdf(uploaded_file):
     pdf_bytes = uploaded_file.getvalue()
@@ -105,11 +105,9 @@ def extract_data_from_pdf(uploaded_file):
     extracted_images_map = {}
 
     for page_num, page in enumerate(doc):
-        # 1. 텍스트 블록 정보 수집
-        # blocks: (x0, y0, x1, y1, "text", block_no, block_type)
         blocks = page.get_text("blocks")
+        blocks.sort(key=lambda b: b[1])  # Y축 정렬
 
-        # 전체 텍스트 추출 (요약용)
         final_text_content += page.get_text() + "\n"
 
         # AI 분석용 페이지 이미지
@@ -117,102 +115,99 @@ def extract_data_from_pdf(uploaded_file):
         img_data = Image.open(io.BytesIO(pix.tobytes("png")))
         all_page_images.append(img_data)
 
-        # 페이지 중앙 좌표 계산 (양단 판단용)
         page_width = page.rect.width
         page_center_x = page_width / 2
 
-        # 2. 캡션 탐색 및 영역 계산
         for i, block in enumerate(blocks):
             text = block[4].strip()
-            bbox = fitz.Rect(block[0], block[1], block[2], block[3])  # 캡션의 위치
+            bbox = fitz.Rect(block[0], block[1], block[2], block[3])
 
-            # 캡션 조건: Fig/Table로 시작하고 짧은 문장
-            if len(text) < 300 and re.match(r"^(Fig|Figure|Table|그림|표)\s*[\.|\s]\s*\d+", text, re.IGNORECASE):
+            # 캡션 인식 (Regex 완화: ^ 제거)
+            if len(text) < 300 and re.search(r"(Fig|Figure|Table|그림|표)\s*[\.|\s]\s*\d+", text, re.IGNORECASE):
 
                 is_table = "Table" in text or "표" in text or "TABLE" in text.upper()
 
-                # 라벨 추출
-                label_match = re.match(r"(Fig\.?|Figure|Table|그림|표)\s*\d+", text, re.IGNORECASE)
+                label_match = re.search(r"(Fig\.?|Figure|Table|그림|표)\s*\d+", text, re.IGNORECASE)
                 real_label = label_match.group(0) if label_match else text[:15]
 
-                # --- [중요] 2단 레이아웃 판단 로직 ---
-                # 캡션의 중심이 왼쪽에 있는지 오른쪽에 있는지 확인
+                # --- 2단 레이아웃 영역 설정 ---
                 caption_center_x = (bbox.x0 + bbox.x1) / 2
 
-                # 검색할 X축 범위 설정 (좌/우 분리)
-                if caption_center_x < page_center_x:
-                    # 왼쪽 단
+                # [개선] 중앙 오버랩 적용 (칼같이 자르지 않음)
+                if caption_center_x < page_center_x:  # 왼쪽 단
                     search_x_min = 0
-                    search_x_max = page_center_x + 10  # 약간의 여유
-                else:
-                    # 오른쪽 단
-                    search_x_min = page_center_x - 10
+                    search_x_max = page_center_x * 1.1  # 중앙을 조금 넘어가도 허용
+                else:  # 오른쪽 단
+                    search_x_min = page_center_x * 0.9  # 중앙 조금 전부터 시작
                     search_x_max = page_width
 
-                # 만약 캡션 자체가 페이지 너비의 70% 이상을 차지하면 '1단(통짜)'로 간주
-                if (bbox.x1 - bbox.x0) > (page_width * 0.7):
+                # 캡션이 페이지 중앙에 걸쳐 있으면 전체 너비 사용
+                if (bbox.x1 - bbox.x0) > (page_width * 0.6):
                     search_x_min = 0
                     search_x_max = page_width
 
                 crop_rect = None
 
-                # --- [A] Table 로직 (캡션 아래 검색) ---
+                # --- [A] Table (캡션 아래) ---
                 if is_table:
-                    top_y = bbox.y1  # 캡션 바로 아래
-                    bottom_y = page.rect.y1 - 30  # 기본값: 페이지 끝
+                    top_y = bbox.y1
+                    bottom_y = page.rect.y1 - 30
 
-                    # 같은 단(Column)에 있는 '다음 텍스트 블록' 찾기 (장벽 감지)
+                    # 텍스트 장벽 찾기
+                    barrier_found = False
                     closest_next_block_y = bottom_y
 
                     for other_block in blocks:
-                        # 자기 자신은 제외
                         if other_block == block: continue
-
                         o_bbox = fitz.Rect(other_block[0], other_block[1], other_block[2], other_block[3])
 
-                        # 1. 같은 단(X축 범위)에 있어야 함
-                        if not (o_bbox.x1 > search_x_min and o_bbox.x0 < search_x_max):
-                            continue
-
-                        # 2. 캡션보다 아래에 있어야 함 (Table 내용보다 더 아래)
-                        if o_bbox.y0 > top_y + 10:  # +10은 여유
+                        # 같은 단에 있고, 캡션보다 아래에 있는가?
+                        if (o_bbox.x1 > search_x_min and o_bbox.x0 < search_x_max) and (o_bbox.y0 > top_y + 5):
                             if o_bbox.y0 < closest_next_block_y:
-                                closest_next_block_y = o_bbox.y0  # 가장 가까운 아래 블록 갱신
+                                closest_next_block_y = o_bbox.y0
+                                barrier_found = True
 
-                    bottom_y = closest_next_block_y
+                    # [안전장치] 장벽을 못 찾았거나 너무 멀면 강제 높이 지정
+                    if not barrier_found or (closest_next_block_y - top_y > 500):
+                        bottom_y = min(page.rect.y1, top_y + 350)  # 350px 강제 캡처
+                    else:
+                        bottom_y = closest_next_block_y
+
                     crop_rect = fitz.Rect(search_x_min, top_y, search_x_max, bottom_y)
 
-                # --- [B] Figure 로직 (캡션 위 검색) ---
+                # --- [B] Figure (캡션 위) ---
                 else:
-                    bottom_y = bbox.y0  # 캡션 바로 위
-                    top_y = page.rect.y0 + 30  # 기본값: 페이지 시작
+                    bottom_y = bbox.y0
+                    top_y = page.rect.y0 + 30
 
-                    # 같은 단(Column)에 있는 '이전 텍스트 블록' 찾기 (장벽 감지)
+                    # 텍스트 장벽 찾기
+                    barrier_found = False
                     closest_prev_block_y = top_y
 
                     for other_block in blocks:
                         if other_block == block: continue
-
                         o_bbox = fitz.Rect(other_block[0], other_block[1], other_block[2], other_block[3])
 
-                        # 1. 같은 단(X축 범위)에 있어야 함
-                        if not (o_bbox.x1 > search_x_min and o_bbox.x0 < search_x_max):
-                            continue
-
-                        # 2. 캡션보다 위에 있어야 함
-                        if o_bbox.y1 < bottom_y - 5:
+                        # 같은 단에 있고, 캡션보다 위에 있는가?
+                        if (o_bbox.x1 > search_x_min and o_bbox.x0 < search_x_max) and (o_bbox.y1 < bottom_y - 5):
                             if o_bbox.y1 > closest_prev_block_y:
-                                closest_prev_block_y = o_bbox.y1  # 가장 가까운 위 블록 갱신
+                                closest_prev_block_y = o_bbox.y1
+                                barrier_found = True
 
-                    top_y = closest_prev_block_y
+                    # [안전장치] 장벽을 못 찾았거나 너무 멀면 강제 높이 지정
+                    if not barrier_found or (bottom_y - closest_prev_block_y > 500):
+                        top_y = max(page.rect.y0, bottom_y - 350)  # 위로 350px 강제 캡처
+                    else:
+                        top_y = closest_prev_block_y
+
                     crop_rect = fitz.Rect(search_x_min, top_y, search_x_max, bottom_y)
 
-                # --- 3. 이미지 캡처 및 저장 ---
-                if crop_rect and crop_rect.height > 30:
+                # --- 3. 이미지 캡처 ---
+                if crop_rect and crop_rect.height > 10:  # 최소 10px
                     try:
                         clip_pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=crop_rect)
 
-                        # [필터] 30px 이하는 버림
+                        # [필터 완화] 30px 이하는 버리지만, 혹시 모르니 로깅
                         if clip_pix.width < 30 or clip_pix.height < 30:
                             continue
 
@@ -246,7 +241,7 @@ def get_gemini_analysis(text, total_images, all_page_images):
     2. **요약은 '개조식(Bullet Points)'으로 작성해.**
     3. **이미지 매칭:**
        - `referenced_images`의 `real_label`은 텍스트에 있는 번호(예: 그림 1, Table 2)와 정확히 일치해야 해.
-       - 내가 잘라낸 이미지(`Image_X`)가 해당 그림 번호의 내용과 맞는지 확인해.
+       - 추출된 이미지(`Image_X`)가 해당 그림 번호의 내용과 맞는지 확인해.
 
     [요청 항목]
     0. title, author, affiliation, year, purpose
@@ -417,14 +412,14 @@ if uploaded_file and paper_num:
         if st.session_state.analyzed_data and st.session_state.analyzed_data['file_name'] == uploaded_file.name:
             st.success("⚡ 저장된 분석 결과를 불러옵니다.")
         else:
-            with st.spinner(f"[{SELECTED_MODEL_NAME}] 분석 중... (2단 레이아웃 처리)"):
+            with st.spinner(f"[{SELECTED_MODEL_NAME}] 분석 중... (강제 캡처 모드)"):
                 try:
                     text, images, all_page_imgs = extract_data_from_pdf(uploaded_file)
 
                     if len(text.strip()) < 500:
                         st.warning("⚠️ 텍스트 추출이 불안정하여 전체 페이지 분석을 병행합니다.")
                     else:
-                        st.info(f"✅ 텍스트 및 {len(images)}개의 이미지(단 분리 적용) 추출 완료!")
+                        st.info(f"✅ 텍스트 및 {len(images)}개의 이미지(Force Crop) 추출 완료!")
 
                     result = get_gemini_analysis(text, len(images), all_page_imgs)
 
@@ -468,6 +463,6 @@ if uploaded_file and paper_num:
         st.download_button(
             label="📥 엑셀 파일 다운로드",
             data=excel_data,
-            file_name=f"Analysis_v7.1_{paper_num}.xlsx",
+            file_name=f"Analysis_v7.2_{paper_num}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
