@@ -14,7 +14,7 @@ st.set_page_config(page_title="논문 분석 Pro", layout="wide")
 # -----------------------------------------------------------
 # [2] 메인 UI
 # -----------------------------------------------------------
-st.title("📑 논문 분석 Pro [ver10.4 - Hybrid Summary]")
+st.title("📑 논문 분석 Pro [ver10.4]")
 st.caption("✅ 스캔본(이미지 문서) 완벽 대응 | 텍스트 없으면 AI가 눈으로 보고 요약 | 이미지 짤림 방지")
 
 # -----------------------------------------------------------
@@ -451,3 +451,4 @@ if uploaded_file and paper_num:
             file_name=f"Analysis_v10.4_{paper_num}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
+
