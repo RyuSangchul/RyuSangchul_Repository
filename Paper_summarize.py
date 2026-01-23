@@ -14,8 +14,8 @@ st.set_page_config(page_title="논문 분석 Pro", layout="wide")
 # -----------------------------------------------------------
 # [2] 메인 UI
 # -----------------------------------------------------------
-st.title("📑 논문 분석 Pro [ver10.2 - Crash Fix]")
-st.caption("✅ 좌표 데이터 오류 자동 회피 | AI Vision 인식 | 멈춤 현상 해결")
+st.title("📑 논문 분석 Pro [ver10.3 - Wide Capture]")
+st.caption("✅ 이미지 잘림 방지 | 상하좌우 여백(Padding) 자동 확장 | 캡션 방향 추가 확보")
 
 # -----------------------------------------------------------
 # [3] 사이드바
@@ -51,7 +51,7 @@ with st.sidebar:
         st.success(f"연결됨: {selected_model_name}")
 
         if "pro" in selected_model_name:
-            st.info("💡 Pro 모델: 그림 위치를 더 정확하게 찾습니다.")
+            st.info("💡 Pro 모델: 정밀도가 높습니다.")
         else:
             st.info("⚡ Flash 모델: 속도가 빠릅니다.")
 
@@ -63,18 +63,19 @@ model = genai.GenerativeModel(SELECTED_MODEL_NAME)
 
 
 # -----------------------------------------------------------
-# [4] 핵심 로직: AI Vision을 이용한 좌표 추출 (오류 수정됨)
+# [4] 핵심 로직: AI Vision (프롬프트 강화)
 # -----------------------------------------------------------
 def detect_regions_with_gemini(page_image):
     prompt = """
     Look at this research paper page. 
-    Detect all **Figures (charts, diagrams, photos)** and **Tables**.
+    Detect all **Figures** and **Tables**.
 
     [Rules]
     1. Return Bounding Boxes in **normalized coordinates (0 to 1000)**: [ymin, xmin, ymax, xmax].
-    2. **ALWAYS return 4 numbers** for the box.
-    3. Include Captions: The box MUST include the label (e.g., "Fig. 1") and description.
-    4. Group multiple parts (a, b) into ONE box if they share a caption.
+    2. **IMPORTANT: Be GENEROUS with the bounding box.** - Expand the box to include ALL labels, axis titles, legends, and the full caption text.
+       - Do not cut off the edges of charts or tables.
+    3. **ALWAYS return 4 numbers** for the box.
+    4. Group multiple parts (a, b) into ONE box.
     5. Output JSON list.
 
     Example:
@@ -109,12 +110,12 @@ def extract_data_from_pdf(uploaded_file):
     total_pages = len(doc)
 
     for page_num, page in enumerate(doc):
-        status_text.text(f"🔍 AI가 {page_num + 1}/{total_pages} 페이지를 보고 있습니다...")
+        status_text.text(f"🔍 AI가 {page_num + 1}/{total_pages} 페이지를 정밀 분석 중입니다...")
         progress_bar.progress((page_num + 1) / total_pages)
 
         final_text_content += page.get_text() + "\n"
 
-        # 이미지 변환
+        # 이미지 변환 (고해상도 유지)
         pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
         img_data_bytes = pix.tobytes("png")
         pil_image = Image.open(io.BytesIO(img_data_bytes))
@@ -129,28 +130,43 @@ def extract_data_from_pdf(uploaded_file):
         if detected_objects:
             for obj in detected_objects:
                 label = obj.get("label", "Unknown")
+                obj_type = obj.get("type", "Figure")  # Figure or Table
                 box = obj.get("box_2d")
 
-                # [Fix] box 데이터 유효성 검사 (None이거나 갯수가 4개가 아니면 스킵)
+                # 좌표 유효성 검사
                 if not box or not isinstance(box, list) or len(box) != 4:
-                    print(f"⚠️ 좌표 데이터 오류 발생 (Skip): {box}")
                     continue
 
                 ymin, xmin, ymax, xmax = box
 
-                # 좌표 변환
+                # 좌표 변환 (0~1000 -> 실제 좌표)
                 real_x0 = (xmin / 1000) * page_width
                 real_y0 = (ymin / 1000) * page_height
                 real_x1 = (xmax / 1000) * page_width
                 real_y1 = (ymax / 1000) * page_height
 
-                pad = 10
-                crop_rect = fitz.Rect(
-                    max(0, real_x0 - pad),
-                    max(0, real_y0 - pad),
-                    min(page_width, real_x1 + pad),
-                    min(page_height, real_y1 + pad)
-                )
+                # [핵심] 여백(Padding) 추가 로직
+                # 기본 여백: 상하좌우 20px (테두리 잘림 방지)
+                pad_x = 20
+                pad_y = 20
+
+                final_x0 = max(0, real_x0 - pad_x)
+                final_x1 = min(page_width, real_x1 + pad_x)
+
+                # 캡션 위치에 따른 추가 확장 (Directional Expansion)
+                # Figure는 보통 설명이 아래에 있음 -> 아래쪽으로 대폭 확장
+                if "Figure" in obj_type or "Fig" in label:
+                    final_y0 = max(0, real_y0 - pad_y)
+                    final_y1 = min(page_height, real_y1 + 50)  # 아래로 50px 더!
+                # Table은 보통 설명이 위에 있음 -> 위쪽으로 대폭 확장
+                elif "Table" in obj_type or "Tab" in label:
+                    final_y0 = max(0, real_y0 - 50)  # 위로 50px 더!
+                    final_y1 = min(page_height, real_y1 + pad_y)
+                else:
+                    final_y0 = max(0, real_y0 - pad_y)
+                    final_y1 = min(page_height, real_y1 + pad_y)
+
+                crop_rect = fitz.Rect(final_x0, final_y0, final_x1, final_y1)
 
                 if crop_rect.width < 50 or crop_rect.height < 50: continue
 
@@ -305,7 +321,6 @@ def create_excel(paper_number, analysis_json, images, final_figures, final_table
                     with Image.open(io.BytesIO(target['bytes'])) as img:
                         w_px, h_px = img.size
 
-                    # 이미지 크기 최적화
                     scale = 0.5
                     display_h = h_px * scale
                     row_h = display_h * 0.75
@@ -370,11 +385,9 @@ if uploaded_file and paper_num:
                         for img in images:
                             img_label = img['initial_label']
                             matched_caption = "설명 없음"
-                            # 매칭 로직 (파일명에 포함된 경우)
                             for ref in ref_imgs:
-                                # 정규화된 라벨 비교
-                                ref_l = standardize_label_to_korean(ref.get('real_label', ''))[2]  # 그림 1
-                                img_l = standardize_label_to_korean(img_label)[2]  # 그림 1
+                                ref_l = standardize_label_to_korean(ref.get('real_label', ''))[2]
+                                img_l = standardize_label_to_korean(img_label)[2]
                                 if ref_l == img_l:
                                     matched_caption = ref.get('caption', '-')
                                     break
@@ -416,6 +429,6 @@ if uploaded_file and paper_num:
         st.download_button(
             label="📥 엑셀 파일 다운로드",
             data=excel_data,
-            file_name=f"Analysis_v10.2_{paper_num}.xlsx",
+            file_name=f"Analysis_v10.3_{paper_num}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
