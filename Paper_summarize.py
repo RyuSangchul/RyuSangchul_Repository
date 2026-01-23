@@ -14,8 +14,8 @@ st.set_page_config(page_title="논문 분석 Pro", layout="wide")
 # -----------------------------------------------------------
 # [2] 메인 UI
 # -----------------------------------------------------------
-st.title("📑 논문 분석 Pro [ver10.1 - Vision + Custom Model]")
-st.caption("✅ 딥러닝 비전 인식(좌표 추출) | 모델 선택 기능 복구 (2.5-flash 등 자유 선택)")
+st.title("📑 논문 분석 Pro [ver10.2 - Crash Fix]")
+st.caption("✅ 좌표 데이터 오류 자동 회피 | AI Vision 인식 | 멈춤 현상 해결")
 
 # -----------------------------------------------------------
 # [3] 사이드바
@@ -39,7 +39,6 @@ with st.sidebar:
                 name = m.name.replace('models/', '')
                 available_models.append(name)
 
-        # 사용자가 선호했던 순서대로 정렬 (2.5-flash 우선)
         preferred = ['gemini-2.5-flash', 'gemini-1.5-flash', 'gemini-1.5-pro']
         available_models.sort(key=lambda x: (x not in preferred, x))
 
@@ -51,9 +50,8 @@ with st.sidebar:
         SELECTED_MODEL_NAME = f"models/{selected_model_name}"
         st.success(f"연결됨: {selected_model_name}")
 
-        # 모델별 팁 표시
         if "pro" in selected_model_name:
-            st.info("💡 Pro 모델: 속도는 느리지만 그림 위치를 더 정확하게 찾습니다.")
+            st.info("💡 Pro 모델: 그림 위치를 더 정확하게 찾습니다.")
         else:
             st.info("⚡ Flash 모델: 속도가 빠릅니다.")
 
@@ -65,23 +63,21 @@ model = genai.GenerativeModel(SELECTED_MODEL_NAME)
 
 
 # -----------------------------------------------------------
-# [4] 핵심 로직: AI Vision을 이용한 좌표 추출
+# [4] 핵심 로직: AI Vision을 이용한 좌표 추출 (오류 수정됨)
 # -----------------------------------------------------------
 def detect_regions_with_gemini(page_image):
-    """
-    페이지 이미지를 Gemini에게 보내서 Figure와 Table의 좌표를 받아옴.
-    """
     prompt = """
     Look at this research paper page. 
     Detect all **Figures (charts, diagrams, photos)** and **Tables**.
 
     [Rules]
     1. Return Bounding Boxes in **normalized coordinates (0 to 1000)**: [ymin, xmin, ymax, xmax].
-    2. **Include Captions:** The bounding box MUST include the Figure/Table label (e.g., "Fig. 1", "Table 1") and its description text.
-    3. **Group Together:** If a figure has multiple parts (a, b, c) and one caption, group them into ONE bounding box.
-    4. **Output Format:** JSON list of objects.
+    2. **ALWAYS return 4 numbers** for the box.
+    3. Include Captions: The box MUST include the label (e.g., "Fig. 1") and description.
+    4. Group multiple parts (a, b) into ONE box if they share a caption.
+    5. Output JSON list.
 
-    Example Output:
+    Example:
     [
       {"type": "Figure", "label": "Fig. 1", "box_2d": [100, 50, 400, 500]},
       {"type": "Table", "label": "Table 1", "box_2d": [500, 50, 700, 950]}
@@ -108,51 +104,46 @@ def extract_data_from_pdf(uploaded_file):
     all_page_images = []
     extracted_images_map = {}
 
-    # 진행률 표시 바
     progress_bar = st.progress(0)
     status_text = st.empty()
     total_pages = len(doc)
 
     for page_num, page in enumerate(doc):
-        # 진행 상황 업데이트
         status_text.text(f"🔍 AI가 {page_num + 1}/{total_pages} 페이지를 보고 있습니다...")
         progress_bar.progress((page_num + 1) / total_pages)
 
-        # 1. 텍스트 추출 (요약용)
         final_text_content += page.get_text() + "\n"
 
-        # 2. 페이지를 이미지로 변환 (AI 분석용)
-        # 해상도를 높여야(dpi=200 이상) 작은 글씨도 잘 보임
+        # 이미지 변환
         pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
         img_data_bytes = pix.tobytes("png")
         pil_image = Image.open(io.BytesIO(img_data_bytes))
         all_page_images.append(pil_image)
 
-        # 3. [Deep Learning] AI에게 좌표 요청
-        # 비전 기능이 있는 모델인지 확인 후 요청
+        # AI Vision 좌표 요청
         detected_objects = detect_regions_with_gemini(pil_image)
 
         page_width = page.rect.width
         page_height = page.rect.height
 
-        # 4. AI가 알려준 좌표대로 자르기
         if detected_objects:
             for obj in detected_objects:
                 label = obj.get("label", "Unknown")
-                box = obj.get("box_2d")  # [ymin, xmin, ymax, xmax] (0~1000)
+                box = obj.get("box_2d")
 
-                if not box: continue
+                # [Fix] box 데이터 유효성 검사 (None이거나 갯수가 4개가 아니면 스킵)
+                if not box or not isinstance(box, list) or len(box) != 4:
+                    print(f"⚠️ 좌표 데이터 오류 발생 (Skip): {box}")
+                    continue
 
-                # 좌표 정규화 (0~1000 -> 실제 PDF 좌표)
-                # Gemini Vision은 [ymin, xmin, ymax, xmax] 순서로 줌
                 ymin, xmin, ymax, xmax = box
 
+                # 좌표 변환
                 real_x0 = (xmin / 1000) * page_width
                 real_y0 = (ymin / 1000) * page_height
                 real_x1 = (xmax / 1000) * page_width
                 real_y1 = (ymax / 1000) * page_height
 
-                # 좌표 유효성 검사 및 여유 공간(Padding) 추가
                 pad = 10
                 crop_rect = fitz.Rect(
                     max(0, real_x0 - pad),
@@ -164,7 +155,6 @@ def extract_data_from_pdf(uploaded_file):
                 if crop_rect.width < 50 or crop_rect.height < 50: continue
 
                 try:
-                    # 고해상도 캡처
                     clip_pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=crop_rect)
                     img_bytes = clip_pix.tobytes("png")
 
@@ -175,7 +165,7 @@ def extract_data_from_pdf(uploaded_file):
                         "id": img_id,
                         "page": page_num + 1,
                         "bytes": img_bytes,
-                        "initial_label": label,  # AI가 읽은 라벨 (예: Fig. 1)
+                        "initial_label": label,
                         "real_label": label
                     }
                 except Exception as e:
@@ -209,7 +199,6 @@ def get_gemini_analysis(text, total_images, all_page_images):
     }}
     """
     inputs = [prompt]
-    # 텍스트가 너무 길면 잘라서 보냄
     if len(text.strip()) > 500:
         inputs.append(f"[Text Data]:\n{text[:50000]}")
     else:
@@ -223,7 +212,7 @@ def get_gemini_analysis(text, total_images, all_page_images):
 
 
 # -----------------------------------------------------------
-# [6] 엑셀 생성 및 유틸리티 (기존과 동일하지만 안정성 강화)
+# [6] 엑셀 생성 및 유틸리티
 # -----------------------------------------------------------
 def standardize_label_to_korean(label_text):
     if not label_text: return ("Unknown", 999, "미분류")
@@ -316,7 +305,7 @@ def create_excel(paper_number, analysis_json, images, final_figures, final_table
                     with Image.open(io.BytesIO(target['bytes'])) as img:
                         w_px, h_px = img.size
 
-                    # 이미지 크기 최적화 (엑셀 셀 높이 조절)
+                    # 이미지 크기 최적화
                     scale = 0.5
                     display_h = h_px * scale
                     row_h = display_h * 0.75
@@ -358,13 +347,11 @@ if uploaded_file and paper_num:
         st.session_state.analyzed_data = None
 
     if st.button("분석 및 엑셀 변환 시작"):
-        # 진행 중 상태 표시
         if st.session_state.analyzed_data and st.session_state.analyzed_data['file_name'] == uploaded_file.name:
             st.success("⚡ 저장된 분석 결과를 불러옵니다.")
         else:
-            with st.spinner(f"[{SELECTED_MODEL_NAME}] AI가 눈으로 보고 분석 중... (시간이 조금 걸립니다)"):
+            with st.spinner(f"[{SELECTED_MODEL_NAME}] AI Vision 분석 중..."):
                 try:
-                    # 1. 이미지 추출 (AI Vision 사용)
                     text, images, all_page_imgs = extract_data_from_pdf(uploaded_file)
 
                     if not images:
@@ -372,30 +359,26 @@ if uploaded_file and paper_num:
                     else:
                         st.info(f"✅ AI가 {len(images)}개의 그림/표 영역을 인식했습니다!")
 
-                    # 2. 내용 분석
                     result = get_gemini_analysis(text, len(images), all_page_imgs)
 
                     if "error" in result:
                         st.error(f"AI 분석 오류: {result['error']}")
                     else:
-                        # 3. 매칭 및 정렬
                         ref_imgs = result.get('referenced_images', [])
-
                         final_figs, final_tbls = [], []
 
                         for img in images:
-                            img_label = img['initial_label']  # Vision이 읽은 라벨 (예: Fig 1)
-
-                            # 분석 결과에서 설명 찾기
+                            img_label = img['initial_label']
                             matched_caption = "설명 없음"
+                            # 매칭 로직 (파일명에 포함된 경우)
                             for ref in ref_imgs:
-                                # 단순 포함 관계 확인 (Fig 1 in Figure 1)
-                                # AI가 읽은 라벨과 분석된 라벨을 최대한 매칭
-                                if normalize_id(img_label) == normalize_id(ref.get('real_label', '')):
+                                # 정규화된 라벨 비교
+                                ref_l = standardize_label_to_korean(ref.get('real_label', ''))[2]  # 그림 1
+                                img_l = standardize_label_to_korean(img_label)[2]  # 그림 1
+                                if ref_l == img_l:
                                     matched_caption = ref.get('caption', '-')
                                     break
 
-                            # 분류 및 저장
                             d_type, d_num, k_label = standardize_label_to_korean(img_label)
 
                             item = {
@@ -433,6 +416,6 @@ if uploaded_file and paper_num:
         st.download_button(
             label="📥 엑셀 파일 다운로드",
             data=excel_data,
-            file_name=f"Analysis_v10.1_{paper_num}.xlsx",
+            file_name=f"Analysis_v10.2_{paper_num}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
