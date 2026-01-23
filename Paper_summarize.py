@@ -14,8 +14,8 @@ st.set_page_config(page_title="논문 분석 Pro", layout="wide")
 # -----------------------------------------------------------
 # [2] 메인 UI
 # -----------------------------------------------------------
-st.title("📑 논문 분석 Pro [ver10.0 - AI Vision]")
-st.caption("✅ 딥러닝 비전 인식 | AI가 눈으로 보고 그림/표 위치를 직접 찾아냅니다. (가장 정확함)")
+st.title("📑 논문 분석 Pro [ver10.1 - Vision + Custom Model]")
+st.caption("✅ 딥러닝 비전 인식(좌표 추출) | 모델 선택 기능 복구 (2.5-flash 등 자유 선택)")
 
 # -----------------------------------------------------------
 # [3] 사이드바
@@ -32,12 +32,34 @@ with st.sidebar:
     genai.configure(api_key=api_key_input, transport='rest')
 
     st.subheader("🤖 AI 모델 선택")
-    # Vision 기능을 잘 수행하는 모델 우선
-    model_options = ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-2.0-flash-exp']
-    selected_model_name = st.selectbox("✅ 모델 선택 (Vision 특화)", model_options, index=0)
-    SELECTED_MODEL_NAME = f"models/{selected_model_name}"
+    try:
+        available_models = []
+        for m in genai.list_models():
+            if 'generateContent' in m.supported_generation_methods:
+                name = m.name.replace('models/', '')
+                available_models.append(name)
 
-    st.info("💡 Tip: '1.5-pro'가 속도는 느리지만 그림 위치를 더 정확하게 찾습니다.")
+        # 사용자가 선호했던 순서대로 정렬 (2.5-flash 우선)
+        preferred = ['gemini-2.5-flash', 'gemini-1.5-flash', 'gemini-1.5-pro']
+        available_models.sort(key=lambda x: (x not in preferred, x))
+
+        selected_model_name = st.selectbox(
+            "✅ 모델 선택 (2.5-flash 기본)",
+            available_models,
+            index=0
+        )
+        SELECTED_MODEL_NAME = f"models/{selected_model_name}"
+        st.success(f"연결됨: {selected_model_name}")
+
+        # 모델별 팁 표시
+        if "pro" in selected_model_name:
+            st.info("💡 Pro 모델: 속도는 느리지만 그림 위치를 더 정확하게 찾습니다.")
+        else:
+            st.info("⚡ Flash 모델: 속도가 빠릅니다.")
+
+    except Exception as e:
+        st.error(f"모델 목록 오류: {e}")
+        st.stop()
 
 model = genai.GenerativeModel(SELECTED_MODEL_NAME)
 
@@ -107,8 +129,7 @@ def extract_data_from_pdf(uploaded_file):
         all_page_images.append(pil_image)
 
         # 3. [Deep Learning] AI에게 좌표 요청
-        # 페이지가 텍스트만 꽉 차있으면 스킵하는 로직을 추가하면 비용 절약 가능하지만,
-        # 정확도를 위해 모든 페이지 검사 (사용자 요청 반영)
+        # 비전 기능이 있는 모델인지 확인 후 요청
         detected_objects = detect_regions_with_gemini(pil_image)
 
         page_width = page.rect.width
@@ -360,16 +381,7 @@ if uploaded_file and paper_num:
                         # 3. 매칭 및 정렬
                         ref_imgs = result.get('referenced_images', [])
 
-                        # AI가 찾은 이미지 ID와 설명 매칭
-                        # Vision 단계에서 찾은 라벨(Fig 1)과 분석 단계의 라벨을 매칭
                         final_figs, final_tbls = [], []
-
-                        # 매칭 로직 개선: 순서대로 매칭하거나 라벨 텍스트 유사도로 매칭
-                        # 여기서는 단순화를 위해 Vision에서 찾은 순서대로 정렬되었다고 가정하고
-                        # Gemini가 분석한 내용의 순서와 Vision이 찾은 이미지 순서를 최대한 맞춤
-
-                        # (간단 매칭: Vision이 찾은 이미지 리스트에 분석된 캡션을 붙임)
-                        # 실제로는 Vision 단계에서 'Fig 1' 텍스트까지 읽어오므로 그것을 키로 사용
 
                         for img in images:
                             img_label = img['initial_label']  # Vision이 읽은 라벨 (예: Fig 1)
@@ -378,6 +390,7 @@ if uploaded_file and paper_num:
                             matched_caption = "설명 없음"
                             for ref in ref_imgs:
                                 # 단순 포함 관계 확인 (Fig 1 in Figure 1)
+                                # AI가 읽은 라벨과 분석된 라벨을 최대한 매칭
                                 if normalize_id(img_label) == normalize_id(ref.get('real_label', '')):
                                     matched_caption = ref.get('caption', '-')
                                     break
@@ -420,6 +433,6 @@ if uploaded_file and paper_num:
         st.download_button(
             label="📥 엑셀 파일 다운로드",
             data=excel_data,
-            file_name=f"Analysis_v10.0_{paper_num}.xlsx",
+            file_name=f"Analysis_v10.1_{paper_num}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
