@@ -15,8 +15,8 @@ st.set_page_config(page_title="논문 분석 Pro", layout="wide")
 # -----------------------------------------------------------
 # [2] 메인 UI
 # -----------------------------------------------------------
-st.title("📑 논문 분석 Pro [ver7.9 - Stability Fix]")
-st.caption("✅ 엑셀 저장/이미지 추출 오류 완벽 해결 | 캡션 포함 캡처 | 안정성 강화")
+st.title("📑 논문 분석 Pro [ver8.0 - Visual Verification]")
+st.caption("✅ 캡션 기준 탐색 -> 시각 요소(선/그림) 검증 -> 정밀 캡처 | 엑셀 저장 오류 해결")
 
 # -----------------------------------------------------------
 # [3] 사이드바
@@ -92,7 +92,7 @@ def standardize_label_to_korean(label_text):
 
 
 # -----------------------------------------------------------
-# [5] 핵심 로직 함수 (오류 수정됨)
+# [5] 핵심 로직 함수 (시각적 요소 검증 및 정밀 캡처)
 # -----------------------------------------------------------
 def extract_data_from_pdf(uploaded_file):
     pdf_bytes = uploaded_file.getvalue()
@@ -105,18 +105,21 @@ def extract_data_from_pdf(uploaded_file):
     extracted_images_map = {}
 
     for page_num, page in enumerate(doc):
+        # 텍스트 블록 수집 (Y축 정렬)
         blocks = page.get_text("blocks")
         blocks.sort(key=lambda b: b[1])
         final_text_content += page.get_text() + "\n"
 
+        # AI 분석용 페이지 이미지
         pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
         img_data = Image.open(io.BytesIO(pix.tobytes("png")))
         all_page_images.append(img_data)
 
-        # [Fix] 시각적 요소 수집 로직 수정
+        # [검증 데이터] 페이지 내 '진짜 그림 요소' 좌표 수집
+        # Drawings: 선, 네모, 그래프 축 등 (Vector)
+        # Images: 사진, 비트맵 등 (Raster)
         visual_elements = []
 
-        # 1. 드로잉(선, 도형)
         try:
             drawings = page.get_drawings()
             for d in drawings:
@@ -124,12 +127,11 @@ def extract_data_from_pdf(uploaded_file):
         except:
             pass
 
-        # 2. 이미지 객체 (get_image_rects 문법 오류 수정)
         image_list = page.get_images(full=True)
         for img in image_list:
             xref = img[0]
             try:
-                # [수정됨] full=True 옵션 제거
+                # get_image_rects는 full=True 옵션 없음 (수정됨)
                 rects = page.get_image_rects(xref)
                 for r in rects:
                     visual_elements.append(r)
@@ -144,14 +146,14 @@ def extract_data_from_pdf(uploaded_file):
             text = block[4].strip()
             bbox = fitz.Rect(block[0], block[1], block[2], block[3])
 
-            # 캡션 인식
+            # 1. 캡션 인식 (Fig/Table)
             if len(text) < 300 and re.search(r"(Fig|Figure|Table|그림|표)\s*[\.|\s]\s*\d+", text, re.IGNORECASE):
 
                 is_table = "Table" in text or "표" in text or "TABLE" in text.upper()
                 label_match = re.search(r"(Fig\.?|Figure|Table|그림|표)\s*\d+", text, re.IGNORECASE)
                 real_label = label_match.group(0) if label_match else text[:15]
 
-                # 단(Column) 판단
+                # 단(Column) 영역 설정
                 caption_center_x = (bbox.x0 + bbox.x1) / 2
                 col_width = 0
                 if (bbox.x1 - bbox.x0) > (page_width * 0.6):  # 1단
@@ -166,84 +168,109 @@ def extract_data_from_pdf(uploaded_file):
 
                 crop_rect = None
 
-                # --- [A] Table (캡션 아래) ---
+                # =========================================================
+                # [A] Table Logic (캡션 아래쪽 검색)
+                # =========================================================
                 if is_table:
-                    top_y = max(0, bbox.y0 - 5)
-                    search_limit_y = min(page_height, top_y + 600)
+                    # 시작점: 캡션의 천장(y0)부터 (캡션 포함)
+                    start_y = max(0, bbox.y0 - 5)
+                    # 탐색 한계: 페이지 끝까지
+                    search_limit_y = page_height - 30
 
+                    # 1. 텍스트 장벽 찾기 (본문)
                     barrier_y = search_limit_y
-
                     for other_block in blocks:
                         if other_block == block: continue
                         o_bbox = fitz.Rect(other_block[0], other_block[1], other_block[2], other_block[3])
 
+                        # 캡션보다 아래에 있는 텍스트
                         if (o_bbox.x1 > col_x0 and o_bbox.x0 < col_x1) and (o_bbox.y0 > bbox.y1 + 5):
                             other_text = other_block[4].strip()
                             o_width = o_bbox.x1 - o_bbox.x0
 
-                            # 긴 글 or 넓은 글 -> 장벽
+                            # [조건] 50자 이상이거나, 너비가 넓으면 본문으로 간주
                             if len(other_text) > 50 or (col_width > 0 and o_width > col_width * 0.8):
                                 if o_bbox.y0 < barrier_y:
                                     barrier_y = o_bbox.y0
-                                    break
+                                    break  # 가장 가까운 장벽 발견
 
-                    max_visual_y = top_y + 50
+                    # 2. 시각적 요소 검증 (진짜 표 내용 찾기)
+                    # 장벽(barrier_y) 위쪽, 캡션 아래쪽에 있는 선/그림의 '바닥'을 찾음
+                    max_visual_y = bbox.y1 + 20  # 최소한 캡션보단 아래여야 함
+
                     for v_rect in visual_elements:
-                        if (v_rect.x1 > col_x0 and v_rect.x0 < col_x1) and \
-                                (v_rect.y0 >= bbox.y1) and (v_rect.y1 <= barrier_y):
-                            if v_rect.y1 > max_visual_y:
-                                max_visual_y = v_rect.y1
+                        # 같은 단 내부에 있고
+                        if (v_rect.x1 > col_x0 and v_rect.x0 < col_x1):
+                            # 캡션 아래 ~ 장벽 위에 위치하는가?
+                            if (v_rect.y0 >= bbox.y1) and (v_rect.y1 <= barrier_y + 10):  # +10 여유
+                                if v_rect.y1 > max_visual_y:
+                                    max_visual_y = v_rect.y1
 
-                    # 강제 캡처 로직
-                    if max_visual_y == top_y + 50 and barrier_y == search_limit_y:
-                        final_bottom = min(page_height, top_y + 350)
+                    # 3. 최종 바닥 결정 (Tight Fit)
+                    # 시각적 요소가 발견되었으면 그 끝에 맞춤 (흰 여백 제거)
+                    # 발견 안 되었으면 장벽까지 캡처 (혹시 모르니)
+                    if max_visual_y > bbox.y1 + 20:
+                        final_bottom = max_visual_y + 5
                     else:
-                        final_bottom = max(max_visual_y, barrier_y if barrier_y < search_limit_y else top_y + 100)
-                        if barrier_y < search_limit_y:
-                            final_bottom = min(final_bottom, barrier_y)
+                        # 시각적 요소를 못 찾은 경우 -> 장벽까지 (단, 최대 400px 제한)
+                        final_bottom = min(barrier_y, start_y + 400)
 
-                    crop_rect = fitz.Rect(col_x0, top_y, col_x1, final_bottom)
+                    crop_rect = fitz.Rect(col_x0, start_y, col_x1, final_bottom)
 
-                # --- [B] Figure (캡션 위) ---
+                # =========================================================
+                # [B] Figure Logic (캡션 위쪽 검색) - 여기가 중요!
+                # =========================================================
                 else:
-                    bottom_y = min(page_height, bbox.y1 + 5)
-                    search_limit_y = max(0, bottom_y - 600)
+                    # 시작점: 캡션의 바닥(y1)까지 (캡션 포함)
+                    start_y = min(page_height, bbox.y1 + 5)
+                    # 탐색 한계: 페이지 시작점
+                    search_limit_y = 30
 
+                    # 1. 텍스트 장벽 찾기 (이전 본문)
                     barrier_y = search_limit_y
-
                     for other_block in blocks:
                         if other_block == block: continue
                         o_bbox = fitz.Rect(other_block[0], other_block[1], other_block[2], other_block[3])
 
+                        # 캡션보다 위에 있는 텍스트
                         if (o_bbox.x1 > col_x0 and o_bbox.x0 < col_x1) and (o_bbox.y1 < bbox.y0 - 5):
                             other_text = other_block[4].strip()
                             o_width = o_bbox.x1 - o_bbox.x0
 
-                            # 긴 글 or 넓은 글 -> 장벽
+                            # [조건] 본문이면 장벽
                             if len(other_text) > 50 or (col_width > 0 and o_width > col_width * 0.8):
                                 if o_bbox.y1 > barrier_y:
                                     barrier_y = o_bbox.y1
 
-                    min_visual_y = bottom_y - 50
+                    # 2. 시각적 요소 검증 (진짜 그림 찾기)
+                    # 장벽(barrier_y) 아래, 캡션 위쪽에 있는 선/그림의 '천장'을 찾음
+                    min_visual_y = bbox.y0 - 20  # 초기값
                     found_visual = False
+
                     for v_rect in visual_elements:
-                        if (v_rect.x1 > col_x0 and v_rect.x0 < col_x1) and \
-                                (v_rect.y1 <= bbox.y0) and (v_rect.y0 >= barrier_y):
-                            if v_rect.y0 < min_visual_y:
-                                min_visual_y = v_rect.y0
-                                found_visual = True
+                        if (v_rect.x1 > col_x0 and v_rect.x0 < col_x1):
+                            # 장벽 아래 ~ 캡션 위에 위치하는가?
+                            if (v_rect.y1 <= bbox.y0) and (v_rect.y0 >= barrier_y - 10):
+                                if v_rect.y0 < min_visual_y:
+                                    min_visual_y = v_rect.y0
+                                    found_visual = True
 
-                    if not found_visual and barrier_y == search_limit_y:
-                        final_top = max(0, bottom_y - 350)
+                    # 3. 최종 천장 결정 (Tight Fit)
+                    if found_visual:
+                        # 그림의 맨 위쪽 라인에 맞춤 (흰 여백 제거)
+                        final_top = max(barrier_y, min_visual_y - 5)
                     else:
-                        final_top = min(min_visual_y, barrier_y if barrier_y > search_limit_y else bottom_y - 100)
+                        # 시각적 요소가 없으면(스캔본 등) 장벽까지, 없으면 400px 위로
                         if barrier_y > search_limit_y:
-                            final_top = max(final_top, barrier_y)
+                            final_top = barrier_y
+                        else:
+                            final_top = max(0, start_y - 400)
 
-                    crop_rect = fitz.Rect(col_x0, final_top, col_x1, bottom_y)
+                    crop_rect = fitz.Rect(col_x0, final_top, col_x1, start_y)
 
-                # --- 3. 캡처 실행 ---
+                # --- 4. 캡처 및 저장 ---
                 if crop_rect:
+                    # 너무 얇은 경우 보정 (최소 50px)
                     if crop_rect.height < 50:
                         if is_table:
                             crop_rect.y1 += 150
@@ -253,7 +280,8 @@ def extract_data_from_pdf(uploaded_file):
                     try:
                         clip_pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=crop_rect)
 
-                        if clip_pix.width < 50 or clip_pix.height < 50:
+                        # [최종 필터] 생성된 이미지가 너무 작거나 비어있으면 스킵
+                        if clip_pix.width < 30 or clip_pix.height < 30:
                             continue
 
                         img_bytes = clip_pix.tobytes("png")
@@ -363,7 +391,7 @@ def create_excel(paper_number, analysis_json, images, final_figures, final_table
 
     current_row = 1
     for label, content in data_map:
-        # [Fix] 엑셀 리스트 오류 방지 (리스트 -> 문자열 변환)
+        # [Fix] 리스트 -> 문자열 변환 (2중 안전장치)
         if isinstance(content, list):
             content = "\n".join(map(str, content))
         elif content is None:
@@ -405,7 +433,6 @@ def _write_row_dynamic(ws, item, images, row, label_fmt, content_fmt):
     final_label = item.get('korean_label', item.get('real_label', '그림'))
     caption_text = item.get('caption', '설명 없음')
 
-    # [Fix] 엑셀 쓰기 시 강제 문자열 변환
     ws.write(row, 0, str(final_label), label_fmt)
     ws.write(row, 1, f"📄 {str(caption_text)}", content_fmt)
 
@@ -458,14 +485,14 @@ if uploaded_file and paper_num:
         if st.session_state.analyzed_data and st.session_state.analyzed_data['file_name'] == uploaded_file.name:
             st.success("⚡ 저장된 분석 결과를 불러옵니다.")
         else:
-            with st.spinner(f"[{SELECTED_MODEL_NAME}] 분석 중... (오류 수정 및 안정화)"):
+            with st.spinner(f"[{SELECTED_MODEL_NAME}] 분석 중... (오류 해결 및 검증 모드)"):
                 try:
                     text, images, all_page_imgs = extract_data_from_pdf(uploaded_file)
 
                     if len(text.strip()) < 500:
                         st.warning("⚠️ 텍스트 추출이 불안정하여 전체 페이지 분석을 병행합니다.")
                     else:
-                        st.info(f"✅ 텍스트 및 {len(images)}개의 이미지(캡션 포함) 추출 완료!")
+                        st.info(f"✅ 텍스트 및 {len(images)}개의 검증된 이미지 추출 완료!")
 
                     result = get_gemini_analysis(text, len(images), all_page_imgs)
 
@@ -509,6 +536,6 @@ if uploaded_file and paper_num:
         st.download_button(
             label="📥 엑셀 파일 다운로드",
             data=excel_data,
-            file_name=f"Analysis_v7.9_{paper_num}.xlsx",
+            file_name=f"Analysis_v8.0_{paper_num}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
