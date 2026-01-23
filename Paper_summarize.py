@@ -4,7 +4,6 @@ import fitz  # PyMuPDF
 import xlsxwriter
 import io
 import json
-import re
 from PIL import Image
 
 # -----------------------------------------------------------
@@ -15,8 +14,8 @@ st.set_page_config(page_title="논문 분석 Pro", layout="wide")
 # -----------------------------------------------------------
 # [2] 메인 UI
 # -----------------------------------------------------------
-st.title("📑 논문 분석 Pro [ver8.1 - Table Support]")
-st.caption("✅ Table(아래쪽 탐색) 로직 추가 | Figure(위쪽 탐색) 정밀화 | 엑셀 저장 안정화")
+st.title("📑 논문 분석 Pro [ver10.0 - AI Vision]")
+st.caption("✅ 딥러닝 비전 인식 | AI가 눈으로 보고 그림/표 위치를 직접 찾아냅니다. (가장 정확함)")
 
 # -----------------------------------------------------------
 # [3] 사이드바
@@ -33,42 +32,180 @@ with st.sidebar:
     genai.configure(api_key=api_key_input, transport='rest')
 
     st.subheader("🤖 AI 모델 선택")
-    try:
-        available_models = []
-        for m in genai.list_models():
-            if 'generateContent' in m.supported_generation_methods:
-                name = m.name.replace('models/', '')
-                available_models.append(name)
+    # Vision 기능을 잘 수행하는 모델 우선
+    model_options = ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-2.0-flash-exp']
+    selected_model_name = st.selectbox("✅ 모델 선택 (Vision 특화)", model_options, index=0)
+    SELECTED_MODEL_NAME = f"models/{selected_model_name}"
 
-        preferred = ['gemini-2.5-flash', 'gemini-1.5-flash']
-        available_models.sort(key=lambda x: (x not in preferred, x))
-
-        selected_model_name = st.selectbox(
-            "✅ 모델 선택 (2.5-flash 기본)",
-            available_models,
-            index=0
-        )
-        SELECTED_MODEL_NAME = f"models/{selected_model_name}"
-        st.success(f"연결됨: {selected_model_name}")
-
-    except Exception as e:
-        st.error(f"모델 목록 오류: {e}")
-        st.stop()
+    st.info("💡 Tip: '1.5-pro'가 속도는 느리지만 그림 위치를 더 정확하게 찾습니다.")
 
 model = genai.GenerativeModel(SELECTED_MODEL_NAME)
 
 
 # -----------------------------------------------------------
-# [4] 유틸리티 함수
+# [4] 핵심 로직: AI Vision을 이용한 좌표 추출
 # -----------------------------------------------------------
-def normalize_id(ref_text):
-    nums = re.findall(r'\d+', str(ref_text))
-    return f"Image_{nums[0]}" if nums else None
+def detect_regions_with_gemini(page_image):
+    """
+    페이지 이미지를 Gemini에게 보내서 Figure와 Table의 좌표를 받아옴.
+    """
+    prompt = """
+    Look at this research paper page. 
+    Detect all **Figures (charts, diagrams, photos)** and **Tables**.
+
+    [Rules]
+    1. Return Bounding Boxes in **normalized coordinates (0 to 1000)**: [ymin, xmin, ymax, xmax].
+    2. **Include Captions:** The bounding box MUST include the Figure/Table label (e.g., "Fig. 1", "Table 1") and its description text.
+    3. **Group Together:** If a figure has multiple parts (a, b, c) and one caption, group them into ONE bounding box.
+    4. **Output Format:** JSON list of objects.
+
+    Example Output:
+    [
+      {"type": "Figure", "label": "Fig. 1", "box_2d": [100, 50, 400, 500]},
+      {"type": "Table", "label": "Table 1", "box_2d": [500, 50, 700, 950]}
+    ]
+    """
+
+    try:
+        response = model.generate_content(
+            [prompt, page_image],
+            generation_config={"response_mime_type": "application/json"}
+        )
+        return json.loads(response.text)
+    except:
+        return []
 
 
+def extract_data_from_pdf(uploaded_file):
+    pdf_bytes = uploaded_file.getvalue()
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+
+    final_text_content = ""
+    image_counter = 1
+
+    all_page_images = []
+    extracted_images_map = {}
+
+    # 진행률 표시 바
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    total_pages = len(doc)
+
+    for page_num, page in enumerate(doc):
+        # 진행 상황 업데이트
+        status_text.text(f"🔍 AI가 {page_num + 1}/{total_pages} 페이지를 보고 있습니다...")
+        progress_bar.progress((page_num + 1) / total_pages)
+
+        # 1. 텍스트 추출 (요약용)
+        final_text_content += page.get_text() + "\n"
+
+        # 2. 페이지를 이미지로 변환 (AI 분석용)
+        # 해상도를 높여야(dpi=200 이상) 작은 글씨도 잘 보임
+        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+        img_data_bytes = pix.tobytes("png")
+        pil_image = Image.open(io.BytesIO(img_data_bytes))
+        all_page_images.append(pil_image)
+
+        # 3. [Deep Learning] AI에게 좌표 요청
+        # 페이지가 텍스트만 꽉 차있으면 스킵하는 로직을 추가하면 비용 절약 가능하지만,
+        # 정확도를 위해 모든 페이지 검사 (사용자 요청 반영)
+        detected_objects = detect_regions_with_gemini(pil_image)
+
+        page_width = page.rect.width
+        page_height = page.rect.height
+
+        # 4. AI가 알려준 좌표대로 자르기
+        if detected_objects:
+            for obj in detected_objects:
+                label = obj.get("label", "Unknown")
+                box = obj.get("box_2d")  # [ymin, xmin, ymax, xmax] (0~1000)
+
+                if not box: continue
+
+                # 좌표 정규화 (0~1000 -> 실제 PDF 좌표)
+                # Gemini Vision은 [ymin, xmin, ymax, xmax] 순서로 줌
+                ymin, xmin, ymax, xmax = box
+
+                real_x0 = (xmin / 1000) * page_width
+                real_y0 = (ymin / 1000) * page_height
+                real_x1 = (xmax / 1000) * page_width
+                real_y1 = (ymax / 1000) * page_height
+
+                # 좌표 유효성 검사 및 여유 공간(Padding) 추가
+                pad = 10
+                crop_rect = fitz.Rect(
+                    max(0, real_x0 - pad),
+                    max(0, real_y0 - pad),
+                    min(page_width, real_x1 + pad),
+                    min(page_height, real_y1 + pad)
+                )
+
+                if crop_rect.width < 50 or crop_rect.height < 50: continue
+
+                try:
+                    # 고해상도 캡처
+                    clip_pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=crop_rect)
+                    img_bytes = clip_pix.tobytes("png")
+
+                    img_id = f"Image_{image_counter}"
+                    image_counter += 1
+
+                    extracted_images_map[img_id] = {
+                        "id": img_id,
+                        "page": page_num + 1,
+                        "bytes": img_bytes,
+                        "initial_label": label,  # AI가 읽은 라벨 (예: Fig. 1)
+                        "real_label": label
+                    }
+                except Exception as e:
+                    print(f"Crop Error: {e}")
+                    continue
+
+    status_text.text("✅ 분석 완료! 엑셀을 생성합니다.")
+    progress_bar.empty()
+
+    extracted_images = list(extracted_images_map.values())
+    return final_text_content, extracted_images, all_page_images
+
+
+def get_gemini_analysis(text, total_images, all_page_images):
+    prompt = f"""
+    너는 논문 분석 전문가야. 아래 텍스트 데이터를 바탕으로 내용을 한국어로 요약해.
+
+    [지시사항]
+    1. 요약(intro, body, conclusion)은 반드시 '한국어(Korean)'로 개조식 작성.
+    2. `referenced_images`의 `real_label`은 텍스트의 번호(예: Fig 1, Table 1)와 일치시킬 것.
+    3. 이미지가 본문 내용에서 어떤 의미를 갖는지 `caption`에 상세히 적어줘.
+
+    [JSON 형식]
+    {{
+        "title": "제목", "author": "저자", "affiliation": "소속", "year": "연도", "purpose": "목적",
+        "intro_summary": "- ...",
+        "body_summary": "- ...",
+        "conclusion_summary": "- ...",
+        "key_images_desc": "주요 그림 설명 요약",
+        "referenced_images": [ {{ "img_id": "Image_1", "real_label": "Fig. 1", "caption": "한국어 설명" }} ]
+    }}
+    """
+    inputs = [prompt]
+    # 텍스트가 너무 길면 잘라서 보냄
+    if len(text.strip()) > 500:
+        inputs.append(f"[Text Data]:\n{text[:50000]}")
+    else:
+        inputs.append("텍스트가 부족합니다. 이미지를 참고하세요.")
+
+    try:
+        response = model.generate_content(inputs, generation_config={"response_mime_type": "application/json"})
+        return json.loads(response.text)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# -----------------------------------------------------------
+# [6] 엑셀 생성 및 유틸리티 (기존과 동일하지만 안정성 강화)
+# -----------------------------------------------------------
 def standardize_label_to_korean(label_text):
     if not label_text: return ("Unknown", 999, "미분류")
-
     label_upper = str(label_text).upper()
     detected_type = "Figure"
     korean_prefix = "그림"
@@ -80,6 +217,7 @@ def standardize_label_to_korean(label_text):
         detected_type = "Figure"
         korean_prefix = "그림"
 
+    import re
     nums = re.findall(r'\d+', label_text)
     if nums:
         detected_num = int(nums[0])
@@ -87,260 +225,7 @@ def standardize_label_to_korean(label_text):
     else:
         detected_num = 999
         final_label = f"{korean_prefix} (번호 없음)"
-
     return (detected_type, detected_num, final_label)
-
-
-# -----------------------------------------------------------
-# [5] 핵심 로직 함수 (Table & Figure 방향성 분리)
-# -----------------------------------------------------------
-def extract_data_from_pdf(uploaded_file):
-    pdf_bytes = uploaded_file.getvalue()
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-
-    final_text_content = ""
-    image_counter = 1
-
-    all_page_images = []
-    extracted_images_map = {}
-
-    for page_num, page in enumerate(doc):
-        blocks = page.get_text("blocks")
-        blocks.sort(key=lambda b: b[1])
-        final_text_content += page.get_text() + "\n"
-
-        pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
-        img_data = Image.open(io.BytesIO(pix.tobytes("png")))
-        all_page_images.append(img_data)
-
-        # [중요] 페이지 내 "진짜 그림/표 요소(Vector)" 좌표 수집
-        visual_elements = []
-
-        # 1. 드로잉(선, 표 테두리, 그래프 축)
-        try:
-            drawings = page.get_drawings()
-            for d in drawings:
-                visual_elements.append(d["rect"])
-        except:
-            pass
-
-        # 2. 이미지 객체(비트맵)
-        image_list = page.get_images(full=True)
-        for img in image_list:
-            xref = img[0]
-            try:
-                rects = page.get_image_rects(xref)
-                for r in rects:
-                    visual_elements.append(r)
-            except:
-                pass
-
-        page_width = page.rect.width
-        page_height = page.rect.height
-        page_center_x = page_width / 2
-
-        for i, block in enumerate(blocks):
-            text = block[4].strip()
-            bbox = fitz.Rect(block[0], block[1], block[2], block[3])
-
-            # 캡션 인식
-            if len(text) < 300 and re.search(r"(Fig|Figure|Table|그림|표)\s*[\.|\s]\s*\d+", text, re.IGNORECASE):
-
-                is_table = "Table" in text or "표" in text or "TABLE" in text.upper()
-                label_match = re.search(r"(Fig\.?|Figure|Table|그림|표)\s*\d+", text, re.IGNORECASE)
-                real_label = label_match.group(0) if label_match else text[:15]
-
-                # 단(Column) 판단
-                caption_center_x = (bbox.x0 + bbox.x1) / 2
-                col_width = 0
-                if (bbox.x1 - bbox.x0) > (page_width * 0.6):  # 통단
-                    col_x0, col_x1 = 0, page_width
-                    col_width = page_width
-                elif caption_center_x < page_center_x:  # 왼쪽
-                    col_x0, col_x1 = 0, page_center_x + 15
-                    col_width = page_center_x
-                else:  # 오른쪽
-                    col_x0, col_x1 = page_center_x - 15, page_width
-                    col_width = page_width - page_center_x
-
-                crop_rect = None
-
-                # =========================================================
-                # [A] Table Logic (캡션이 위 -> 아래쪽 내용을 가져옴)
-                # =========================================================
-                if is_table:
-                    # 시작: 캡션의 위쪽(y0)부터 (캡션 글자 포함)
-                    start_y = max(0, bbox.y0 - 5)
-                    # 한계: 페이지 끝까지 탐색
-                    search_limit_y = page_height - 30
-
-                    # 1. 텍스트 장벽(다음 문단) 찾기
-                    barrier_y = search_limit_y
-                    for other_block in blocks:
-                        if other_block == block: continue
-                        o_bbox = fitz.Rect(other_block[0], other_block[1], other_block[2], other_block[3])
-
-                        # 캡션보다 "확실히" 아래에 있는 텍스트
-                        if (o_bbox.x1 > col_x0 and o_bbox.x0 < col_x1) and (o_bbox.y0 > bbox.y1 + 10):
-                            other_text = other_block[4].strip()
-                            o_width = o_bbox.x1 - o_bbox.x0
-
-                            # 본문(긴 글)을 만나면 거기서 멈춤
-                            if len(other_text) > 50 or (col_width > 0 and o_width > col_width * 0.8):
-                                if o_bbox.y0 < barrier_y:
-                                    barrier_y = o_bbox.y0
-                                    break
-
-                                    # 2. 시각적 요소(선, 표 테두리) 검증
-                    # 캡션 아래 ~ 장벽 위에 있는 '선'이 어디까지 있는지 확인
-                    max_visual_y = bbox.y1 + 30  # 최소 높이 보장
-                    found_visual = False
-
-                    for v_rect in visual_elements:
-                        # 같은 단 내부
-                        if (v_rect.x1 > col_x0 and v_rect.x0 < col_x1):
-                            # 캡션 아래에 있는가?
-                            if (v_rect.y0 >= bbox.y1) and (v_rect.y1 <= barrier_y + 20):
-                                if v_rect.y1 > max_visual_y:
-                                    max_visual_y = v_rect.y1
-                                    found_visual = True
-
-                    # 3. 최종 바닥 결정
-                    if found_visual:
-                        final_bottom = max_visual_y + 5
-                    else:
-                        # 선이 없으면 장벽까지, 장벽도 없으면 300px 강제
-                        final_bottom = min(barrier_y, start_y + 300)
-
-                    crop_rect = fitz.Rect(col_x0, start_y, col_x1, final_bottom)
-
-                # =========================================================
-                # [B] Figure Logic (캡션이 아래 -> 위쪽 내용을 가져옴)
-                # =========================================================
-                else:
-                    # 시작: 캡션의 바닥(y1)부터 (캡션 글자 포함)
-                    start_y = min(page_height, bbox.y1 + 5)
-                    # 한계: 페이지 시작점
-                    search_limit_y = 30
-
-                    # 1. 텍스트 장벽(이전 문단) 찾기
-                    barrier_y = search_limit_y
-                    for other_block in blocks:
-                        if other_block == block: continue
-                        o_bbox = fitz.Rect(other_block[0], other_block[1], other_block[2], other_block[3])
-
-                        # 캡션보다 위에 있는 텍스트
-                        if (o_bbox.x1 > col_x0 and o_bbox.x0 < col_x1) and (o_bbox.y1 < bbox.y0 - 5):
-                            other_text = other_block[4].strip()
-                            o_width = o_bbox.x1 - o_bbox.x0
-
-                            # 본문이면 장벽
-                            if len(other_text) > 50 or (col_width > 0 and o_width > col_width * 0.8):
-                                if o_bbox.y1 > barrier_y:
-                                    barrier_y = o_bbox.y1
-
-                    # 2. 시각적 요소(그림, 선) 검증
-                    min_visual_y = bbox.y0 - 30  # 최소 높이
-                    found_visual = False
-
-                    for v_rect in visual_elements:
-                        if (v_rect.x1 > col_x0 and v_rect.x0 < col_x1):
-                            # 캡션 위에 있는가?
-                            if (v_rect.y1 <= bbox.y0) and (v_rect.y0 >= barrier_y - 20):
-                                if v_rect.y0 < min_visual_y:
-                                    min_visual_y = v_rect.y0
-                                    found_visual = True
-
-                    # 3. 최종 천장 결정
-                    if found_visual:
-                        final_top = max(barrier_y, min_visual_y - 5)
-                    else:
-                        final_top = max(barrier_y, start_y - 400)  # 없으면 400px 강제
-
-                    crop_rect = fitz.Rect(col_x0, final_top, col_x1, start_y)
-
-                # --- 4. 캡처 및 저장 ---
-                if crop_rect:
-                    # 너무 작으면(10px 미만) 무시
-                    if crop_rect.height < 10: continue
-
-                    try:
-                        clip_pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=crop_rect)
-
-                        # [필터] 아주 작은 노이즈만 제거 (30px)
-                        if clip_pix.width < 30 or clip_pix.height < 30:
-                            continue
-
-                        img_bytes = clip_pix.tobytes("png")
-                        img_id = f"Image_{image_counter}"
-                        image_counter += 1
-
-                        extracted_images_map[img_id] = {
-                            "id": img_id,
-                            "page": page_num + 1,
-                            "bytes": img_bytes,
-                            "initial_label": text,
-                            "real_label": real_label
-                        }
-                    except Exception as e:
-                        print(f"Crop Error: {e}")
-                        continue
-
-    extracted_images = list(extracted_images_map.values())
-    return final_text_content, extracted_images, all_page_images
-
-
-def get_gemini_analysis(text, total_images, all_page_images):
-    inputs = []
-
-    prompt = f"""
-    너는 한국어 논문 분석 전문가야. 제공된 자료를 보고 JSON을 추출해.
-
-    [절대 규칙]
-    1. **모든 요약은 반드시 '한국어(Korean)'로 작성.**
-    2. **요약은 '개조식(Bullet Points)'으로 작성.**
-    3. **이미지 매칭:** `referenced_images`의 `real_label`은 텍스트 번호(예: 그림 1)와 일치해야 함.
-
-    [요청 항목]
-    0. title, author, affiliation, year, purpose
-    1. 요약 (intro_summary, body_summary, conclusion_summary)
-    2. key_images_desc
-    3. referenced_images (img_id, real_label, caption)
-
-    [출력 포맷 JSON]
-    {{
-        "title": "...",
-        "author": "...", "affiliation": "...", "year": "...", "purpose": "...",
-        "intro_summary": "- ...", 
-        "body_summary": "- ...", 
-        "conclusion_summary": "- ...",
-        "key_images_desc": "...",
-        "referenced_images": [ 
-            {{ "img_id": "Image_1", "real_label": "Figure 1", "caption": "설명" }}
-        ]
-    }}
-    """
-
-    inputs.append(prompt)
-
-    is_text_valid = len(text.strip()) > 500
-
-    if is_text_valid:
-        inputs.append(f"[추출된 텍스트 데이터]:\n{text[:50000]}")
-    else:
-        inputs.append("[시스템 알림: 텍스트 추출 실패. 아래의 '전체 페이지 이미지'를 읽고 분석하세요.]")
-
-    if not is_text_valid:
-        max_pages = 30
-        for i, img in enumerate(all_page_images[:max_pages]):
-            inputs.append(f"Page {i + 1} Image:")
-            inputs.append(img)
-
-    try:
-        response = model.generate_content(inputs, generation_config={"response_mime_type": "application/json"})
-        return json.loads(response.text)
-    except Exception as e:
-        return {"error": str(e)}
 
 
 def create_excel(paper_number, analysis_json, images, final_figures, final_tables):
@@ -382,79 +267,63 @@ def create_excel(paper_number, analysis_json, images, final_figures, final_table
             content = "\n".join(map(str, content))
         elif content is None:
             content = "-"
-
         ws1.write(current_row, 0, label, header_style)
         ws1.write(current_row, 1, str(content), content_style)
         current_row += 1
 
-    if final_figures:
+    def write_section(title, items, style):
+        nonlocal current_row
+        if not items: return
         current_row += 1
-        ws1.write(current_row, 0, "그림 (Figures)", header_style)
-        ws1.write(current_row, 1, "▼ 주요 그림 목록", header_style)
+        ws1.write(current_row, 0, title, header_style)
+        ws1.write(current_row, 1, f"▼ 주요 {title} 목록", header_style)
         current_row += 1
-        if current_row % 2 != 0: current_row += 1
-        for item in final_figures:
-            _write_row_dynamic(ws1, item, images, current_row, fig_style, content_style)
+
+        for item in items:
+            clean_id = item.get('img_id')
+            target = next((img for img in images if img['id'] == clean_id), None)
+
+            final_label = item.get('korean_label', item.get('real_label', '그림'))
+            caption_text = item.get('caption', '설명 없음')
+
+            ws1.write(current_row, 0, str(final_label), style)
+            ws1.write(current_row, 1, f"📄 {str(caption_text)}", content_style)
+
+            img_row = current_row + 1
+            if target:
+                try:
+                    with Image.open(io.BytesIO(target['bytes'])) as img:
+                        w_px, h_px = img.size
+
+                    # 이미지 크기 최적화 (엑셀 셀 높이 조절)
+                    scale = 0.5
+                    display_h = h_px * scale
+                    row_h = display_h * 0.75
+
+                    if row_h > 400:
+                        row_h = 400
+                        scale = (400 / 0.75) / h_px
+
+                    ws1.set_row(img_row, row_h)
+                    ws1.insert_image(img_row, 1, f"{clean_id}.png", {
+                        'image_data': io.BytesIO(target['bytes']),
+                        'x_scale': scale, 'y_scale': scale,
+                        'x_offset': 5, 'y_offset': 5, 'object_position': 1
+                    })
+                except:
+                    pass
             current_row += 2
 
-    if final_tables:
-        current_row += 1
-        ws1.write(current_row, 0, "표 (Tables)", header_style)
-        ws1.write(current_row, 1, "▼ 주요 표 목록", header_style)
-        current_row += 1
-        if current_row % 2 != 0: current_row += 1
-        for item in final_tables:
-            _write_row_dynamic(ws1, item, images, current_row, tbl_style, content_style)
-            current_row += 2
+    write_section("그림 (Figures)", final_figures, fig_style)
+    write_section("표 (Tables)", final_tables, tbl_style)
 
     workbook.close()
     output.seek(0)
     return output
 
 
-def _write_row_dynamic(ws, item, images, row, label_fmt, content_fmt):
-    clean_id = normalize_id(item.get('img_id'))
-    target = next((img for img in images if img['id'] == clean_id), None)
-
-    final_label = item.get('korean_label', item.get('real_label', '그림'))
-    caption_text = item.get('caption', '설명 없음')
-
-    ws.write(row, 0, str(final_label), label_fmt)
-    ws.write(row, 1, f"📄 {str(caption_text)}", content_fmt)
-
-    img_row = row + 1
-
-    if target:
-        try:
-            with Image.open(io.BytesIO(target['bytes'])) as img:
-                w_px, h_px = img.size
-
-            base_scale = 0.5
-            display_h_px = h_px * base_scale
-            row_height_pt = display_h_px * 0.75
-
-            MAX_EXCEL_HEIGHT = 400
-            final_scale = base_scale
-
-            if row_height_pt > MAX_EXCEL_HEIGHT:
-                row_height_pt = MAX_EXCEL_HEIGHT
-                final_scale = (MAX_EXCEL_HEIGHT / 0.75) / h_px
-
-            ws.set_row(img_row, row_height_pt)
-
-            ws.insert_image(img_row, 1, f"{clean_id}.png", {
-                'image_data': io.BytesIO(target['bytes']),
-                'x_scale': final_scale,
-                'y_scale': final_scale,
-                'x_offset': 0, 'y_offset': 0,
-                'object_position': 1
-            })
-        except:
-            pass
-
-
 # -----------------------------------------------------------
-# [6] 실행 로직
+# [7] 실행 로직
 # -----------------------------------------------------------
 
 if 'analyzed_data' not in st.session_state:
@@ -468,34 +337,63 @@ if uploaded_file and paper_num:
         st.session_state.analyzed_data = None
 
     if st.button("분석 및 엑셀 변환 시작"):
+        # 진행 중 상태 표시
         if st.session_state.analyzed_data and st.session_state.analyzed_data['file_name'] == uploaded_file.name:
             st.success("⚡ 저장된 분석 결과를 불러옵니다.")
         else:
-            with st.spinner(f"[{SELECTED_MODEL_NAME}] 분석 중... (Table/Figure 분리 로직)"):
+            with st.spinner(f"[{SELECTED_MODEL_NAME}] AI가 눈으로 보고 분석 중... (시간이 조금 걸립니다)"):
                 try:
+                    # 1. 이미지 추출 (AI Vision 사용)
                     text, images, all_page_imgs = extract_data_from_pdf(uploaded_file)
 
-                    if len(text.strip()) < 500:
-                        st.warning("⚠️ 텍스트 추출이 불안정하여 전체 페이지 분석을 병행합니다.")
+                    if not images:
+                        st.warning("⚠️ AI가 그림/표를 찾지 못했습니다. 모델을 '1.5-pro'로 변경해보세요.")
                     else:
-                        st.info(f"✅ 텍스트 및 {len(images)}개의 시각 자료(표/그림) 추출 완료!")
+                        st.info(f"✅ AI가 {len(images)}개의 그림/표 영역을 인식했습니다!")
 
+                    # 2. 내용 분석
                     result = get_gemini_analysis(text, len(images), all_page_imgs)
 
                     if "error" in result:
                         st.error(f"AI 분석 오류: {result['error']}")
                     else:
+                        # 3. 매칭 및 정렬
                         ref_imgs = result.get('referenced_images', [])
+
+                        # AI가 찾은 이미지 ID와 설명 매칭
+                        # Vision 단계에서 찾은 라벨(Fig 1)과 분석 단계의 라벨을 매칭
                         final_figs, final_tbls = [], []
 
-                        for item in ref_imgs:
-                            raw_label = item.get('real_label', 'Unknown')
-                            detected_type, detected_num, korean_label = standardize_label_to_korean(raw_label)
+                        # 매칭 로직 개선: 순서대로 매칭하거나 라벨 텍스트 유사도로 매칭
+                        # 여기서는 단순화를 위해 Vision에서 찾은 순서대로 정렬되었다고 가정하고
+                        # Gemini가 분석한 내용의 순서와 Vision이 찾은 이미지 순서를 최대한 맞춤
 
-                            item['sort_num'] = detected_num
-                            item['korean_label'] = korean_label
+                        # (간단 매칭: Vision이 찾은 이미지 리스트에 분석된 캡션을 붙임)
+                        # 실제로는 Vision 단계에서 'Fig 1' 텍스트까지 읽어오므로 그것을 키로 사용
 
-                            if detected_type == "Table":
+                        for img in images:
+                            img_label = img['initial_label']  # Vision이 읽은 라벨 (예: Fig 1)
+
+                            # 분석 결과에서 설명 찾기
+                            matched_caption = "설명 없음"
+                            for ref in ref_imgs:
+                                # 단순 포함 관계 확인 (Fig 1 in Figure 1)
+                                if normalize_id(img_label) == normalize_id(ref.get('real_label', '')):
+                                    matched_caption = ref.get('caption', '-')
+                                    break
+
+                            # 분류 및 저장
+                            d_type, d_num, k_label = standardize_label_to_korean(img_label)
+
+                            item = {
+                                'img_id': img['id'],
+                                'real_label': img_label,
+                                'korean_label': k_label,
+                                'caption': matched_caption,
+                                'sort_num': d_num
+                            }
+
+                            if d_type == 'Table':
                                 final_tbls.append(item)
                             else:
                                 final_figs.append(item)
@@ -510,7 +408,7 @@ if uploaded_file and paper_num:
                             'figs': final_figs,
                             'tbls': final_tbls
                         }
-                        st.success("완료! 분석이 끝났습니다.")
+                        st.success("완료! AI가 보고 판단한 결과입니다.")
 
                 except Exception as e:
                     st.error(f"시스템 오류: {e}")
@@ -522,6 +420,6 @@ if uploaded_file and paper_num:
         st.download_button(
             label="📥 엑셀 파일 다운로드",
             data=excel_data,
-            file_name=f"Analysis_v8.1_{paper_num}.xlsx",
+            file_name=f"Analysis_v10.0_{paper_num}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
