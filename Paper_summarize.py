@@ -14,8 +14,8 @@ st.set_page_config(page_title="논문 분석 Pro", layout="wide")
 # -----------------------------------------------------------
 # [2] 메인 UI
 # -----------------------------------------------------------
-st.title("📑 논문 분석 Pro [ver10.3 - Wide Capture]")
-st.caption("✅ 이미지 잘림 방지 | 상하좌우 여백(Padding) 자동 확장 | 캡션 방향 추가 확보")
+st.title("📑 논문 분석 Pro [ver10.4 - Hybrid Summary]")
+st.caption("✅ 스캔본(이미지 문서) 완벽 대응 | 텍스트 없으면 AI가 눈으로 보고 요약 | 이미지 짤림 방지")
 
 # -----------------------------------------------------------
 # [3] 사이드바
@@ -39,6 +39,7 @@ with st.sidebar:
                 name = m.name.replace('models/', '')
                 available_models.append(name)
 
+        # Vision 성능이 좋은 모델 우선
         preferred = ['gemini-2.5-flash', 'gemini-1.5-flash', 'gemini-1.5-pro']
         available_models.sort(key=lambda x: (x not in preferred, x))
 
@@ -51,7 +52,7 @@ with st.sidebar:
         st.success(f"연결됨: {selected_model_name}")
 
         if "pro" in selected_model_name:
-            st.info("💡 Pro 모델: 정밀도가 높습니다.")
+            st.info("💡 Pro 모델: 스캔본 인식률이 더 높습니다.")
         else:
             st.info("⚡ Flash 모델: 속도가 빠릅니다.")
 
@@ -63,7 +64,7 @@ model = genai.GenerativeModel(SELECTED_MODEL_NAME)
 
 
 # -----------------------------------------------------------
-# [4] 핵심 로직: AI Vision (프롬프트 강화)
+# [4] 핵심 로직: AI Vision (좌표 추출)
 # -----------------------------------------------------------
 def detect_regions_with_gemini(page_image):
     prompt = """
@@ -73,7 +74,7 @@ def detect_regions_with_gemini(page_image):
     [Rules]
     1. Return Bounding Boxes in **normalized coordinates (0 to 1000)**: [ymin, xmin, ymax, xmax].
     2. **IMPORTANT: Be GENEROUS with the bounding box.** - Expand the box to include ALL labels, axis titles, legends, and the full caption text.
-       - Do not cut off the edges of charts or tables.
+       - Do not cut off the edges.
     3. **ALWAYS return 4 numbers** for the box.
     4. Group multiple parts (a, b) into ONE box.
     5. Output JSON list.
@@ -113,9 +114,11 @@ def extract_data_from_pdf(uploaded_file):
         status_text.text(f"🔍 AI가 {page_num + 1}/{total_pages} 페이지를 정밀 분석 중입니다...")
         progress_bar.progress((page_num + 1) / total_pages)
 
-        final_text_content += page.get_text() + "\n"
+        # 텍스트 추출 (요약용)
+        text_on_page = page.get_text()
+        final_text_content += text_on_page + "\n"
 
-        # 이미지 변환 (고해상도 유지)
+        # 이미지 변환 (Vision 분석용)
         pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
         img_data_bytes = pix.tobytes("png")
         pil_image = Image.open(io.BytesIO(img_data_bytes))
@@ -130,37 +133,33 @@ def extract_data_from_pdf(uploaded_file):
         if detected_objects:
             for obj in detected_objects:
                 label = obj.get("label", "Unknown")
-                obj_type = obj.get("type", "Figure")  # Figure or Table
+                obj_type = obj.get("type", "Figure")
                 box = obj.get("box_2d")
 
-                # 좌표 유효성 검사
                 if not box or not isinstance(box, list) or len(box) != 4:
                     continue
 
                 ymin, xmin, ymax, xmax = box
 
-                # 좌표 변환 (0~1000 -> 실제 좌표)
+                # 좌표 변환
                 real_x0 = (xmin / 1000) * page_width
                 real_y0 = (ymin / 1000) * page_height
                 real_x1 = (xmax / 1000) * page_width
                 real_y1 = (ymax / 1000) * page_height
 
-                # [핵심] 여백(Padding) 추가 로직
-                # 기본 여백: 상하좌우 20px (테두리 잘림 방지)
+                # [여백 확장 로직]
                 pad_x = 20
                 pad_y = 20
 
                 final_x0 = max(0, real_x0 - pad_x)
                 final_x1 = min(page_width, real_x1 + pad_x)
 
-                # 캡션 위치에 따른 추가 확장 (Directional Expansion)
-                # Figure는 보통 설명이 아래에 있음 -> 아래쪽으로 대폭 확장
+                # 캡션 방향 확장
                 if "Figure" in obj_type or "Fig" in label:
                     final_y0 = max(0, real_y0 - pad_y)
-                    final_y1 = min(page_height, real_y1 + 50)  # 아래로 50px 더!
-                # Table은 보통 설명이 위에 있음 -> 위쪽으로 대폭 확장
+                    final_y1 = min(page_height, real_y1 + 60)  # 아래로 60px
                 elif "Table" in obj_type or "Tab" in label:
-                    final_y0 = max(0, real_y0 - 50)  # 위로 50px 더!
+                    final_y0 = max(0, real_y0 - 60)  # 위로 60px
                     final_y1 = min(page_height, real_y1 + pad_y)
                 else:
                     final_y0 = max(0, real_y0 - pad_y)
@@ -196,8 +195,9 @@ def extract_data_from_pdf(uploaded_file):
 
 
 def get_gemini_analysis(text, total_images, all_page_images):
+    # [프롬프트] 요약 요청
     prompt = f"""
-    너는 논문 분석 전문가야. 아래 텍스트 데이터를 바탕으로 내용을 한국어로 요약해.
+    너는 논문 분석 전문가야. 제공된 자료를 보고 내용을 한국어로 요약해.
 
     [지시사항]
     1. 요약(intro, body, conclusion)은 반드시 '한국어(Korean)'로 개조식 작성.
@@ -214,11 +214,24 @@ def get_gemini_analysis(text, total_images, all_page_images):
         "referenced_images": [ {{ "img_id": "Image_1", "real_label": "Fig. 1", "caption": "한국어 설명" }} ]
     }}
     """
+
     inputs = [prompt]
+
+    # [핵심 로직] 텍스트가 충분한지 확인
     if len(text.strip()) > 500:
+        # 텍스트 PDF: 텍스트로 분석 (빠름)
         inputs.append(f"[Text Data]:\n{text[:50000]}")
     else:
-        inputs.append("텍스트가 부족합니다. 이미지를 참고하세요.")
+        # 스캔본 PDF: 이미지로 분석 (Vision)
+        # 중요: 모든 페이지를 다 보내면 토큰 초과될 수 있으니 최대 20페이지만 전송
+        inputs.append("⚠️ 텍스트 데이터가 부족합니다(스캔 문서). 페이지 이미지를 보고 내용을 분석하세요.")
+
+        max_pages_to_send = 20
+        target_images = all_page_images[:max_pages_to_send]
+
+        for i, img in enumerate(target_images):
+            inputs.append(f"Page {i + 1} Image:")
+            inputs.append(img)
 
     try:
         response = model.generate_content(inputs, generation_config={"response_mime_type": "application/json"})
@@ -367,18 +380,24 @@ if uploaded_file and paper_num:
         else:
             with st.spinner(f"[{SELECTED_MODEL_NAME}] AI Vision 분석 중..."):
                 try:
+                    # 1. 이미지 추출
                     text, images, all_page_imgs = extract_data_from_pdf(uploaded_file)
+
+                    if len(text.strip()) < 500:
+                        st.warning("⚠️ 텍스트 데이터가 부족합니다(스캔 문서). 이미지 기반 분석을 수행합니다.")
 
                     if not images:
                         st.warning("⚠️ AI가 그림/표를 찾지 못했습니다. 모델을 '1.5-pro'로 변경해보세요.")
                     else:
                         st.info(f"✅ AI가 {len(images)}개의 그림/표 영역을 인식했습니다!")
 
+                    # 2. 내용 분석 (텍스트 or 이미지)
                     result = get_gemini_analysis(text, len(images), all_page_imgs)
 
                     if "error" in result:
                         st.error(f"AI 분석 오류: {result['error']}")
                     else:
+                        # 3. 매칭 및 정렬
                         ref_imgs = result.get('referenced_images', [])
                         final_figs, final_tbls = [], []
 
@@ -429,6 +448,6 @@ if uploaded_file and paper_num:
         st.download_button(
             label="📥 엑셀 파일 다운로드",
             data=excel_data,
-            file_name=f"Analysis_v10.3_{paper_num}.xlsx",
+            file_name=f"Analysis_v10.4_{paper_num}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
